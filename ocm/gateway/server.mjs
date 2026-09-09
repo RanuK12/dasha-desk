@@ -10,10 +10,9 @@
  * failover before first token, and gateway-side metering.
  */
 import { createServer } from 'node:http';
-import { readFile, stat } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { randomUUID, createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
 import { createMailer, recoveryMessage, maskEmail } from './mail.mjs';
@@ -21,6 +20,7 @@ import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGui
 import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
+import { AGENT_DIR, installSha256, agentSha256, shortBuild, buildState } from './agentfiles.mjs';
 
 const HEARTBEAT_MS = 30_000;
 const HOST_TIMEOUT_MS = 90_000;
@@ -75,27 +75,7 @@ const MAX_INFLIGHT_PER_HOST = 2;
 
 // The agent and its installer are served from the gateway so a provider fetches
 // exactly the code this deployment expects, rather than a version drifting in a repo.
-const AGENT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'agent');
-/**
- * SHA-256 of the installer we are actually serving, computed from the bytes on disk
- * rather than a build artifact, so the published hash cannot drift from the file.
- * Cached by mtime: the file only changes on deploy.
- */
-let _installHash = null;
-async function installSha256() {
-  try {
-    const path = join(AGENT_DIR, 'install.sh');
-    const { mtimeMs, size } = await stat(path);
-    if (_installHash && _installHash.mtimeMs === mtimeMs && _installHash.size === size) {
-      return _installHash.hex;
-    }
-    const hex = createHash('sha256').update(await readFile(path)).digest('hex');
-    _installHash = { mtimeMs, size, hex };
-    return hex;
-  } catch {
-    return null;   // never let a missing file take the page down
-  }
-}
+// Checksums and build comparison live in agentfiles.mjs.
 
 const DOWNLOADS = {
   '/agent.py': { file: 'agent.py', type: 'text/x-python; charset=utf-8' },
@@ -663,11 +643,14 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
         }
         return apiError(res, 404, `no admin route for ${req.method} ${url.pathname}`);
       }
-      if (req.method === 'GET' && url.pathname === '/install.sh.sha256') {
-        const hash = await installSha256();
-        if (!hash) return apiError(res, 404, 'installer not available');
+      if (req.method === 'GET' && (url.pathname === '/install.sh.sha256' || url.pathname === '/agent.py.sha256')) {
+        const file = url.pathname === '/agent.py.sha256' ? 'agent.py' : 'install.sh';
+        const hash = file === 'agent.py' ? await agentSha256() : await installSha256();
+        if (!hash) return apiError(res, 404, `${file} not available`);
         // `shasum -a 256` output shape, so it can be piped straight into `shasum -c`.
-        const body = `${hash}  install.sh\n`;
+        // For agent.py this is also the build a provider should be on: the doctor and
+        // the console compare against it.
+        const body = `${hash}  ${file}\n`;
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8',
                              'cache-control': 'no-cache',
                              'content-length': Buffer.byteLength(body) });
@@ -753,10 +736,15 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
                                 label: issued.label, rotated: issued.rotated.length });
       }
       if (req.method === 'GET' && url.pathname === '/v1/network') {
+        const served = await agentSha256();
         return json(res, 200, {
+          agent_build: shortBuild(served),
           hosts: registry.online().map((h) => ({
             id: h.id, chip: h.caps.chip, memory_gb: h.caps.memory_gb,
             region: h.caps.region, models: [...h.models],
+            // Which agent this host runs, against the one served here. `stale` and
+            // `unreported` both mean `ocm-agent-update` is due; no account identity.
+            build: shortBuild(h.caps.build), build_state: buildState(h.caps.build, served),
             // Public, and carries no account identity: whether this host will answer
             // in about a second or has to load a model first.
             warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),

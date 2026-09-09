@@ -11,6 +11,8 @@ const HOST_ID = /^[-A-Za-z0-9._]{1,64}$/;
 const MODEL_ID = /^[-A-Za-z0-9._/:@+]{1,256}$/;
 const SHORT_TEXT = /^[^\u0000-\u001f\u007f]{1,96}$/;
 const MAX_MODELS = 32;
+// The agent's build is the SHA-256 of the agent.py it runs (see agentfiles.mjs).
+const BUILD_HEX = /^[a-f0-9]{64}$/;
 
 export function normalizeModelId(value, field = 'model') {
   if (typeof value !== 'string' || !MODEL_ID.test(value)) {
@@ -59,9 +61,18 @@ export function normalizeProviderAgent(agent) {
     memoryGb = agent.memory_gb;
   }
 
+  let build = null;
+  if (agent.build !== undefined && agent.build !== null && agent.build !== '') {
+    if (typeof agent.build !== 'string' || !BUILD_HEX.test(agent.build)) {
+      throw new TypeError('build must be a lowercase hex SHA-256 of the agent file');
+    }
+    build = agent.build;
+  }
+
   return {
     id: agent.id,
     models,
+    build,
     chip: optionalText(agent.chip, 'chip'),
     arch: optionalText(agent.arch, 'arch'),
     region: optionalText(agent.region, 'region'),

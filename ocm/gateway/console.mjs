@@ -1,3 +1,4 @@
+import { agentSha256, shortBuild, buildState, updateAvailable } from './agentfiles.mjs';
 /**
  * Server-rendered consoles (PDF §05: "Consoles — two static pages").
  *
@@ -34,12 +35,20 @@ const ago = (d) => {
  * One table, four steps: code issued, enrolled, first connected, first job. Shared by
  * the owner's dashboard and the admin network view (which adds the owner column).
  */
+/** One cell: the build a host runs, and whether it is the one served. */
+function buildCell(h) {
+  const b = h.build ? `<code>${esc(h.build)}</code>` : '<span class="muted">unreported</span>';
+  if (h.build_state === 'current') return `${b} <span class="muted">current</span>`;
+  if (updateAvailable(h.build_state)) return `${b} <span class="warn-text">update available</span>`;
+  return b;
+}
+
 function funnelTable(rows, { live, firstServed, credited, owner = null }) {
   if (!rows.length) return '';
   const body = rows.map((r) => {
     const h = r.agent_id ? live.get(r.agent_id) : null;
     const now = r.pending ? '<span class="muted">waiting for the installer</span>'
-      : h ? (h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Online, cold')
+      : h ? `${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Online, cold'}${updateAvailable(h.build_state) ? ' <span class="warn-text">· update available</span>' : ''}`
       : r.first_connected_at ? `<span class="muted">offline, seen ${esc(ago(r.last_connected_at))}</span>`
       : '<span class="muted">never connected</span>';
     const name = r.agent_id ? `<code>${esc(r.agent_id)}</code>`
@@ -59,9 +68,11 @@ function funnelTable(rows, { live, firstServed, credited, owner = null }) {
 }
 
 export async function stats(registry, ledger) {
-  const led = await ledger.summary();
+  const [led, served] = await Promise.all([ledger.summary(), agentSha256()]);
   const hosts = registry.online().map((h) => ({
     id: h.id,
+    build: shortBuild(h.caps.build),
+    build_state: buildState(h.caps.build, served),
     chip: h.caps.chip || '—',
     memory_gb: h.caps.memory_gb || 0,
     region: h.caps.region || '—',
@@ -77,6 +88,7 @@ export async function stats(registry, ledger) {
   }));
 
   return {
+    agent_build: shortBuild(served),
     hosts,
     consumers: led.consumers,
     totals: led.totals,
@@ -132,6 +144,7 @@ button.ghost{background:transparent;color:var(--dim);border:1px solid var(--line
 .secret{background:var(--card);border:1px solid var(--warn);border-radius:8px;padding:14px;margin:12px 0}
 .secret code{display:block;word-break:break-all;padding:9px 11px;font-size:13px;background:var(--bg)}
 .muted{color:var(--dim);font-size:13px}
+.warn-text{color:var(--warn);font-weight:600}
 /* Provider guide: one command per line with room around it, so a sequence reads as
    steps rather than a wall. */
 .step{margin:0 0 26px}
@@ -318,7 +331,7 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
   const hostRows = myHosts.length ? myHosts.map((h) => `<tr>
     <td><span class="dot ${h.inflight ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
     <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td>
-    <td>${dur(h.uptime_s)}</td><td>${num(h.credited)}</td>
+    <td>${dur(h.uptime_s)}</td><td>${num(h.credited)}</td><td>${buildCell(h)}</td>
   </tr>`).join('') : '';
 
   const redeemBlock = redeemed ? '' : `
@@ -347,7 +360,7 @@ ${redeemBlock}
 
 <h2>Your providers</h2>
 <div class="tablewrap">${funnelHtml || (hostRows ? `<table class="data">
-<thead><tr><th>Host</th><th>Chip</th><th>Memory</th><th>Uptime</th><th>Tokens credited</th></tr></thead>
+<thead><tr><th>Host</th><th>Chip</th><th>Memory</th><th>Uptime</th><th>Tokens credited</th><th>Agent</th></tr></thead>
 <tbody>${hostRows}</tbody></table>`
   : '<div class="empty">None yet. <a href="/provider">Run a provider</a> to contribute a Mac.</div>')}</div>
 ${funnelHtml ? `<p class="muted" style="margin-top:8px">Each machine's path: code issued, enrolled, first connected, first job served.
@@ -402,9 +415,11 @@ substitution is never silent.</p>`);
  * it will show.
  */
 export async function renderStatus({ registry, ledger }) {
-  const [led, today] = await Promise.all([ledger.summary(), ledger.servedToday()]);
+  const [led, today, served] = await Promise.all([ledger.summary(), ledger.servedToday(), agentSha256()]);
   const hosts = registry.online().map((h) => ({
     id: h.id,
+    build: shortBuild(h.caps.build),
+    build_state: buildState(h.caps.build, served),
     chip: h.caps.chip || '—',
     memory_gb: h.caps.memory_gb || 0,
     region: h.caps.region || '—',
@@ -425,7 +440,7 @@ export async function renderStatus({ registry, ledger }) {
     <td>${state(h)}</td>
     <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td><td>${esc(h.region)}</td>
     <td>${esc(h.models.join(', ') || '—')}</td>
-    <td>${dur(h.uptime_s)}</td></tr>`).join('');
+    <td>${dur(h.uptime_s)}</td><td>${buildCell(h)}</td></tr>`).join('');
 
   return page('OCM status', `${nav('')}
 <h1>Network status</h1>
@@ -439,10 +454,11 @@ export async function renderStatus({ registry, ledger }) {
 
 <h2>Providers</h2>
 <div class="tablewrap">${hostRows ? `<table class="data">
-<thead><tr><th>Host</th><th>State</th><th>Chip</th><th>Memory</th><th>Region</th><th>Serving</th><th>Connected</th></tr></thead>
+<thead><tr><th>Host</th><th>State</th><th>Chip</th><th>Memory</th><th>Region</th><th>Serving</th><th>Connected</th><th>Agent</th></tr></thead>
 <tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected right now.</div>'}</div>
 <p class="cap" style="margin-top:8px">Cold means the machine will load its model on the first request and answer in
-about a minute; Ready and Serving answer in about a second.</p>
+about a minute; Ready and Serving answer in about a second. Agent is the build each machine runs against the
+one this gateway serves${served ? ` (<code>${esc(shortBuild(served))}</code>)` : ''}; a machine that is behind still serves, and its owner updates it with one command.</p>
 
 <h2>Models</h2>
 <p>${models.length ? models.map((m) => `<code>${esc(m)}</code>`).join(' ') : '<span class="muted">None advertised.</span>'}</p>
@@ -476,7 +492,7 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
     <td>${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Cold'}</td>
     <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td>
     <td>${esc(h.models.join(', ') || '—')}</td><td>${h.inflight}</td>
-    <td>${dur(h.uptime_s)}</td><td>${num(h.credited)}</td></tr>`).join('');
+    <td>${dur(h.uptime_s)}</td><td>${num(h.credited)}</td><td>${buildCell(h)}</td></tr>`).join('');
 
   const byConsumer = new Map(s.consumers.map((c) => [c.consumer, c]));
   const acctRows = all.map((a) => {
@@ -505,7 +521,7 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
 
 <h2>Providers</h2>
 <div class="tablewrap">${hostRows ? `<table class="data">
-<thead><tr><th>Host</th><th>Owner</th><th>State</th><th>Chip</th><th>Memory</th><th>Models</th><th>In flight</th><th>Uptime</th><th>Credited</th></tr></thead>
+<thead><tr><th>Host</th><th>Owner</th><th>State</th><th>Chip</th><th>Memory</th><th>Models</th><th>In flight</th><th>Uptime</th><th>Credited</th><th>Agent</th></tr></thead>
 <tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected.</div>'}</div>
 
 <h2>Onboarding funnel</h2>

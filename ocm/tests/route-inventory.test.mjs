@@ -50,6 +50,8 @@ const ROUTES = [
     why: 'same: the code a provider runs should be readable first' },
   { method: 'GET', path: '/install.sh.sha256', auth: 'public', unauth: 200,
     why: 'the checksum is useless if it needs a credential' },
+  { method: 'GET', path: '/agent.py.sha256', auth: 'public', unauth: 200,
+    why: 'the build a provider should be on; the doctor compares against it unauthenticated' },
   { method: 'GET', path: '/console/', auth: 'public', unauth: 200,
     why: 'the landing page. Anonymous gets the sign-in form, never a dashboard' },
   { method: 'GET', path: '/console/recover', auth: 'public', unauth: 200,
