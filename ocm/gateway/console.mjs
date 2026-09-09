@@ -574,12 +574,18 @@ export function renderProviderGuide({ account = null, apiHost, models, admin = f
   Also at <a href="https://${esc(apiHost)}/install.sh.sha256">/install.sh.sha256</a>.</p>`
   : '<p class="cap">Compare with /install.sh.sha256.</p>'}
   <code class="cmd">less install.sh</code>
-  <p class="cap">About 340 lines. It writes only to <code>/opt/ocm</code>,
-  <code>/etc/ocm</code> and <code>/Library/LaunchDaemons</code>.</p>
+  <p class="cap">About 700 lines. It writes only to <code>/opt/ocm</code>,
+  <code>/etc/ocm</code>, <code>/Library/LaunchDaemons</code> and
+  <code>/var/log/ocm-agent.log</code>.</p>
 </div>
 
 <div class="step">
   <h3><span class="num">4</span>Run it</h3>
+  <p class="opt">Optional, preview first</p>
+  <code class="cmd">sudo OCM_AGENT_ID="my-mac" sh install.sh --dry-run</code>
+  <p class="cap">Runs every check and prints what would be written, as whom, and whether
+  this is a fresh install or a reinstall, then exits having written nothing. It needs no
+  code; given one, the code is left unspent.</p>
   <code class="cmd">sudo OCM_AGENT_ID="my-mac" sh install.sh</code>
   <p class="cap">It asks for your enrollment code (or a provider token) with typing hidden,
   so nothing lands in shell history or the process list. Do not put either on the command
@@ -615,6 +621,15 @@ gateway, checks its published checksum, and runs it. The new agent has to pass i
 check as your account before anything is replaced. Add <code>--check</code> to see whether
 a new build exists without changing anything.</p>
 
+<h2>Removing it</h2>
+<code class="cmd">sudo /opt/ocm/bin/ocm-agent-uninstall</code>
+<p class="cap">Stops the daemon and removes what the installer wrote: <code>/opt/ocm</code>,
+<code>/etc/ocm</code>, the launchd plist and the log. Add <code>--dry-run</code> to see the
+list first. The model download in your Hugging Face cache, several GB, stays unless you
+add <code>--purge-cache</code>, and then only that model's directory goes. Afterwards
+revoke the machine's credential on the <a href="/">console</a>; uninstalling cannot do
+that for you.</p>
+
 <details><summary>Setting this up with an AI agent</summary><div class="body">
 <p class="cap">Paste this to it.</p>
 <pre>You are installing the OCM provider agent on this Mac. It contributes idle GPU to a
@@ -626,9 +641,13 @@ Verify before installing:
    curl -fsSL https://${esc(apiHost)}/install.sh -o install.sh
 3. Compare \`shasum -a 256 install.sh\` with https://${esc(apiHost)}/install.sh.sha256
    Stop if they differ.
-4. Read it. About 340 lines. It writes only to /opt/ocm, /etc/ocm and
-   /Library/LaunchDaemons, and sends the token only to /v1/provider/verify.
+4. Read it. About 700 lines. It writes only to /opt/ocm, /etc/ocm,
+   /Library/LaunchDaemons and /var/log/ocm-agent.log. It sends an enrollment code
+   only to /v1/provider/enroll and a token only to /v1/provider/verify.
 5. \`brew install uv\` first if Homebrew is present, to skip the root-shell step.
+6. Preview: sudo OCM_AGENT_ID="a-stable-name" sh install.sh --dry-run
+   It runs every check and prints what it would write, without writing anything or
+   spending a code. Show the user that output before the real run.
 
 Ask the user for an ENROLLMENT CODE starting ocm_enroll_, issued in the console under
 Enroll a Mac (valid 15 minutes, works once). A provider token starting ocm_host_ also
@@ -648,6 +667,8 @@ Confirm with: /opt/ocm/bin/ocm-agent-run --doctor   (expect: token ok)
 The first request takes up to ~90s while the model loads. That is not a fault.
 Rotate later with: sudo /opt/ocm/bin/ocm-agent-token   (it prompts; or pipe on stdin)
 Update later with: sudo /opt/ocm/bin/ocm-agent-update  (--check to only look; no token needed)
+Remove later with: sudo /opt/ocm/bin/ocm-agent-uninstall (--dry-run to only look; the model
+  download stays unless --purge-cache; revoke the credential in the console afterwards)
 Never edit /opt/ocm/bin/ocm-agent-run; it is generated and holds no token.
 
 Tell the user plainly: as a provider they can read every prompt routed to this

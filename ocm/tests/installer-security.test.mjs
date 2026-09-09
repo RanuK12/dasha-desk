@@ -306,3 +306,130 @@ test('a reinstall keeps the region the machine already reports', () => {
   const chown = source.indexOf('chown "$RUN_USER" /etc/ocm/agent.env');
   assert.ok(env > 0 && write > env && write < chown, 'the region line is appended right after the env file is written, before ownership is set');
 });
+
+test('--dry-run runs every check, spends no enrollment code, and exits before anything is written', () => {
+  // P8: an agent's instinct is to preview privileged changes. The preview must be the
+  // real preflight (same PATH, same allowlists, same uv and account resolution), and
+  // it must stop before the first byte lands on disk.
+  assert.match(source, /--dry-run\) DRY_RUN=1 ;;/, 'install.sh must accept --dry-run');
+  assert.match(source, /\*\) die "usage: sudo sh install\.sh \[--dry-run\]" ;;/, 'any other argument is refused');
+  const stop = source.indexOf('dry run; nothing was changed\nPLAN\n  exit 0\nfi\n');
+  assert.ok(stop > 0, 'the dry run ends with a clear message and exit 0');
+  const verify = source.indexOf('"$SOURCE/v1/provider/verify"');
+  assert.ok(verify > 0 && verify < stop, 'the token is still checked against the gateway before the dry run stops');
+  // Every write-shaped step comes after the stop: nothing before it touches the disk.
+  for (const write of [
+    'curl_https --fail "$SOURCE/agent.py"',
+    'mkdir -p "$PREFIX/agent" "$PREFIX/bin"',
+    'install -m 755 "$TMP_AGENT"',
+    'install -d -m 700 /etc/ocm',
+    'cat > /etc/ocm/agent.env',
+    'cat > "$PREFIX/bin/ocm-agent-run"',
+    'cat > "$PREFIX/bin/ocm-agent-token"',
+    'cat > "$PREFIX/bin/ocm-agent-update"',
+    'cat > "$PREFIX/bin/ocm-agent-uninstall"',
+    'touch /var/log/ocm-agent.log',
+    'cat > /Library/LaunchDaemons/com.ocm.agent.plist',
+    'launchctl bootout system/com.ocm.agent 2>/dev/null || true',
+    'launchctl bootstrap system',
+  ]) {
+    const at = source.indexOf(write);
+    assert.ok(at > stop, `${write} must come after the dry-run exit, not before it`);
+  }
+  // A code is single-use and exchanging it revokes the machine's older token, so the
+  // dry run must never reach the exchange with one.
+  const guard = source.indexOf(`if [ "$DRY_RUN" = 1 ] && matches "$OCM_HOST_TOKEN" '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then`);
+  const exchange = source.indexOf(`if matches "$OCM_HOST_TOKEN" '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then`);
+  assert.ok(guard > 0 && guard < exchange, 'the dry-run guard must precede the exchange');
+  assert.match(source.slice(guard, exchange), /ENROLL_PENDING=1\n  OCM_HOST_TOKEN=""\n/,
+    'a code seen by a dry run is set aside, not exchanged');
+  assert.match(source, /left unspent/);
+  // No credential is needed for a preview: the interactive prompt is skipped and the
+  // empty value is tolerated only under --dry-run.
+  assert.match(source, /if \[ -z "\$\{OCM_HOST_TOKEN:-\}" \] && \[ "\$DRY_RUN" = 1 \] && \[ -t 0 \]; then\n  :/);
+  assert.match(source, /\[ -n "\$\{OCM_HOST_TOKEN:-\}" \] \|\| \[ "\$DRY_RUN" = 1 \] \|\| die "provide OCM_HOST_TOKEN/);
+  assert.match(source, /if \[ -n "\$OCM_HOST_TOKEN" \] \|\| \[ "\$DRY_RUN" = 0 \]; then\n  matches "\$OCM_HOST_TOKEN" '\^ocm_host_/,
+    'the real run still requires a well-formed token');
+  // The plan names every file the real run writes, with mode and owner.
+  const plan = source.slice(source.indexOf('# Everything above only reads.'), stop);
+  for (const file of [
+    '$PREFIX/agent/agent.py', '$PREFIX/bin/ocm-agent-run', '$PREFIX/bin/ocm-agent-token',
+    '$PREFIX/bin/ocm-agent-update', '$PREFIX/bin/ocm-agent-uninstall', '/etc/ocm/agent.env',
+    '/var/log/ocm-agent.log', '/Library/LaunchDaemons/com.ocm.agent.plist',
+  ]) assert.match(plan, new RegExp(file.replace(/[$./]/g, '\\$&')), `the dry-run plan must list ${file}`);
+  assert.match(plan, /600, owned by \$RUN_USER; holds the token/);
+  assert.match(plan, /\$RUN_HOME\/\.cache\/huggingface\/hub\/models--/, 'the plan must say where the model cache lives');
+  assert.doesNotMatch(plan, /\$OCM_HOST_TOKEN|\$VERIFY/, 'the plan must not print the token or the gateway response');
+  // It is documented where a provider will look.
+  assert.match(source, /sudo OCM_AGENT_ID="my-mac" sh install\.sh --dry-run/);
+  const guide = renderProviderGuide({ apiHost: 'api.example', models: ['ocm-coder'] });
+  assert.match(guide, /sh install\.sh --dry-run/);
+  assert.match(guide, /spending a code/);
+  assert.doesNotMatch(guide, /About 340 lines/, 'the guide must not understate the installer');
+});
+
+test('the uninstaller removes exactly what the installer wrote and can preview that', () => {
+  const start = source.indexOf("cat > \"$PREFIX/bin/ocm-agent-uninstall\" <<'UNINST'");
+  assert.ok(start > 0, 'install.sh must install ocm-agent-uninstall');
+  const end = source.indexOf('\nUNINST\n', start);
+  assert.ok(end > start);
+  const helper = source.slice(source.indexOf('\n', start) + 1, end + 1);
+  // Quoted heredoc, valid sh, parsed whole before it deletes itself.
+  assert.match(source, /<<'UNINST'\n/);
+  const check = spawnSync('sh', ['-n'], { input: helper, encoding: 'utf8' });
+  assert.equal(check.status, 0, check.stderr);
+  assert.match(helper, /^main\(\) \{$/m);
+  assert.match(helper, /\nmain "\$@"\n$/);
+  assert.match(helper, /\[ "\$\(id -u\)" = "0" \] \|\| \{ echo "run with sudo" >&2; exit 1; \}/);
+  // Preview, and refuse anything it does not understand.
+  assert.match(helper, /--dry-run\) DRY_RUN=1 ;;/);
+  assert.match(helper, /--purge-cache\) PURGE=1 ;;/);
+  assert.match(helper, /\*\) echo "usage: ocm-agent-uninstall \[--dry-run\] \[--purge-cache\]" >&2; exit 1 ;;/);
+  const stop = helper.indexOf('echo "dry run; nothing was changed"\n  exit 0\n');
+  assert.ok(stop > 0);
+  // Every rm is a literal path the installer wrote, or the one allowlisted model dir,
+  // and every one of them comes after the dry-run exit.
+  const rms = [...helper.matchAll(/^\s*(?:if [^\n]*; then )?(rm -r?f [^\n;]+)/gm)].map((m) => m[1].trim());
+  assert.deepEqual(rms.sort(), [
+    'rm -f "$LOG"',
+    'rm -f "$PLIST"',
+    'rm -rf "$HUB"',
+    'rm -rf /opt/ocm /etc/ocm',
+  ]);
+  for (const rm of rms) assert.ok(helper.indexOf(rm) > stop, `${rm} must come after the dry-run exit`);
+  assert.match(helper, /^PLIST=\/Library\/LaunchDaemons\/com\.ocm\.agent\.plist$/m);
+  assert.match(helper, /^LOG=\/var\/log\/ocm-agent\.log$/m);
+  // The cache purge is opt-in and scoped to one model directory whose shape is checked
+  // right before use; the whole ~/.cache or hub is never a target.
+  assert.match(helper, /if \[ "\$PURGE" = 1 \] && \[ -n "\$HUB" \]; then rm -rf "\$HUB"; fi/);
+  assert.ok(helper.includes(`grep -Eq '^/[-A-Za-z0-9._/+]+/\\.cache/huggingface/hub/models--[-A-Za-z0-9._+]+$'`),
+    'the model directory must be allowlisted before it can be removed');
+  assert.match(helper, /\[ -n "\$HUB" \] && \[ -d "\$HUB" \] \|\| HUB=""/);
+  assert.doesNotMatch(helper, /rm -rf "\$OWNER_HOME|rm -rf "\$HOME|\.cache"\s*$/m);
+  // The owner is resolved the way the other helpers do it, and root's home is never used.
+  assert.match(helper, /OWNER=\$\(stat -f '%Su' "\$ENV"/);
+  assert.match(helper, /\[ "\$OWNER" != root \]/);
+  // bootout waits for the job to go, as the installer learned to.
+  assert.match(helper, /launchctl bootout system\/com\.ocm\.agent 2>\/dev\/null \|\| true\nn=0\nwhile launchctl print system\/com\.ocm\.agent/);
+  // It never prints or forwards the token, and tells the operator to revoke it.
+  for (const line of helper.split('\n')) {
+    if (/^\s*#/.test(line)) continue;
+    assert.doesNotMatch(line, /(?:echo|printf|cat)[^\n]*OCM_HOST_TOKEN/, `uninstaller must not print the token: ${line}`);
+  }
+  assert.doesNotMatch(helper, /cat "\$ENV"|cat \/etc\/ocm\/agent\.env/);
+  assert.doesNotMatch(helper, /curl/);
+  assert.match(helper, /not revoked/);
+  // Installed executable after the update helper and before launchd is touched; the
+  // printed rm -rf is gone from the closing instructions and the guide documents it.
+  const chmod = source.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-uninstall"');
+  const update = source.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-update"');
+  // The uninstaller carries its own bootout line; the installer's is the last one.
+  const bootout = source.lastIndexOf('launchctl bootout system/com.ocm.agent 2>/dev/null || true');
+  assert.ok(update < start && chmod > end && chmod < bootout);
+  assert.match(source, /remove\s+sudo \$PREFIX\/bin\/ocm-agent-uninstall/);
+  assert.doesNotMatch(source, /remove\s+sudo launchctl bootout[^\n]*rm -rf/, 'the printed rm -rf uninstall is retired');
+  const guide = renderProviderGuide({ apiHost: 'api.example', models: ['ocm-coder'] });
+  assert.match(guide, /sudo \/opt\/ocm\/bin\/ocm-agent-uninstall/);
+  assert.match(guide, /--purge-cache/);
+  assert.match(guide, /Remove later with: sudo \/opt\/ocm\/bin\/ocm-agent-uninstall/);
+});
