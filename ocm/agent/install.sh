@@ -2,8 +2,14 @@
 # OCM provider installer for macOS (Apple Silicon).
 #
 # Read this before running it: piping an unread script into a shell is a bad habit.
-# It is about 500 lines. The two parts worth your attention are the token check at the
+# It is about 700 lines. The two parts worth your attention are the token check at the
 # top, which runs before anything is written, and the launchd handling at the end.
+#
+# To see what it would do before letting it:
+#   sudo OCM_AGENT_ID="my-mac" sh install.sh --dry-run
+# That runs every check, reports what would be written and as whom, and exits before
+# anything is downloaded or written. It needs no code or token. Given a token it checks
+# it against the gateway; given an enrollment code it leaves the code unspent.
 #
 # What it does:
 #   1. refuses to run on anything but Apple Silicon macOS
@@ -11,6 +17,7 @@
 #   3. downloads the agent over HTTPS and proves its doctor path before replacing files
 #   4. stores your provider token in an owner-only environment file
 #   5. installs a launchd daemon that runs as the invoking non-root user
+#   6. installs ocm-agent-token, ocm-agent-update and ocm-agent-uninstall beside it
 #
 # Human path — get an enrollment code from the console (Enroll a machine), then:
 #   sudo OCM_AGENT_ID="my-mac" sh install.sh
@@ -82,6 +89,14 @@ curl_https() {
     --proto '=https' --proto-redir '=https' --tlsv1.2 "$@"
 }
 
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    *) die "usage: sudo sh install.sh [--dry-run]" ;;
+  esac
+done
+
 [ "$(uname -s)" = "Darwin" ] || die "this installer is for macOS"
 [ "$(uname -m)" = "arm64" ] || die "Apple Silicon is required — MLX cannot run on an Intel Mac"
 [ "$(id -u)" = "0" ] || die "run with sudo: installing the launchd daemon needs root"
@@ -96,7 +111,9 @@ if [ -z "${OCM_HOST_TOKEN:-}" ] && [ -n "${OCM_HOST_TOKEN_FILE:-}" ]; then
     || die "OCM_HOST_TOKEN_FILE is missing or unreadable"
   IFS= read -r OCM_HOST_TOKEN < "$OCM_HOST_TOKEN_FILE" || true
 fi
-if [ -z "${OCM_HOST_TOKEN:-}" ]; then
+if [ -z "${OCM_HOST_TOKEN:-}" ] && [ "$DRY_RUN" = 1 ] && [ -t 0 ]; then
+  : # a dry run asks for nothing; the real run prompts here
+elif [ -z "${OCM_HOST_TOKEN:-}" ]; then
   if [ -t 0 ]; then
     printf 'Provider token or enrollment code (input is hidden): ' >&2
     if stty_state=$(stty -g 2>/dev/null); then
@@ -111,7 +128,7 @@ if [ -z "${OCM_HOST_TOKEN:-}" ]; then
     IFS= read -r OCM_HOST_TOKEN || true
   fi
 fi
-[ -n "${OCM_HOST_TOKEN:-}" ] || die "provide OCM_HOST_TOKEN via --preserve-env, OCM_HOST_TOKEN_FILE, stdin, or the hidden prompt"
+[ -n "${OCM_HOST_TOKEN:-}" ] || [ "$DRY_RUN" = 1 ] || die "provide OCM_HOST_TOKEN via --preserve-env, OCM_HOST_TOKEN_FILE, stdin, or the hidden prompt"
 # The prompt, file and stdin paths leave this as a plain shell variable. The doctor
 # below runs under `sudo -u … --preserve-env=OCM_HOST_TOKEN`, which can only carry an
 # exported one; without this line every path except --preserve-env failed the doctor
@@ -132,6 +149,13 @@ matches "$SOURCE" '^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$' \
 matches "$AGENT_ID" '^[-A-Za-z0-9._]{1,64}$' \
   || die "OCM_AGENT_ID may contain only letters, numbers, dot, underscore and hyphen (64 max)"
 
+# A code works once, and exchanging it revokes the machine's older token, so a dry run
+# leaves it unspent and only reports that the exchange would happen.
+ENROLL_PENDING=0
+if [ "$DRY_RUN" = 1 ] && matches "$OCM_HOST_TOKEN" '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then
+  ENROLL_PENDING=1
+  OCM_HOST_TOKEN=""
+fi
 # An enrollment code is exchanged for a provider token before anything else happens.
 # The code travels in a JSON body over HTTPS on curl's stdin, never in a URL, a log
 # line or argv (--data "…" would be argv, visible in ps); the
@@ -161,8 +185,10 @@ if matches "$OCM_HOST_TOKEN" '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then
     printf '  (rotated %s older token(s) for this machine)\n' "$ROTATED"
   fi
 fi
-matches "$OCM_HOST_TOKEN" '^ocm_host_[-A-Za-z0-9_]{16,}$' \
-  || die "OCM_HOST_TOKEN must be an issued provider token beginning ocm_host_, or an ocm_enroll_ code"
+if [ -n "$OCM_HOST_TOKEN" ] || [ "$DRY_RUN" = 0 ]; then
+  matches "$OCM_HOST_TOKEN" '^ocm_host_[-A-Za-z0-9_]{16,}$' \
+    || die "OCM_HOST_TOKEN must be an issued provider token beginning ocm_host_, or an ocm_enroll_ code"
+fi
 matches "$MLX_MODEL" '^[-A-Za-z0-9._/:@+]+$' 512 \
   || die "OCM_MLX_MODEL contains unsupported characters or is too long"
 matches "$MODEL_MAP" '^[-A-Za-z0-9._/:@=,+]+$' 2048 \
@@ -205,22 +231,81 @@ sudo -u "$RUN_USER" test -x "$UV" \
   || die "OCM_UV_BIN is not executable by OCM_RUN_USER"
 
 # Check the credential BEFORE downloading or replacing anything. Fail here, with a
-# useful reason, while the operator is still watching the terminal.
-printf 'checking your provider token …\n'
-VERIFY=$(curl_https --fail -H "Authorization: Bearer $OCM_HOST_TOKEN" \
-  "$SOURCE/v1/provider/verify" 2>/dev/null) || {
-  REASON=$(curl_https -H "Authorization: Bearer $OCM_HOST_TOKEN" \
-    "$SOURCE/v1/provider/verify" 2>/dev/null \
-    | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
-  die "${REASON:-could not reach $SOURCE to check the token}"
-}
-printf '%s' "$VERIFY" | grep -q '"ok":true' \
-  || die "the gateway response did not confirm this provider token"
-printf '  token accepted\n'
+# useful reason, while the operator is still watching the terminal. A dry run without
+# a token still proves the gateway is the one it would download from.
+if [ -n "$OCM_HOST_TOKEN" ]; then
+  printf 'checking your provider token …\n'
+  VERIFY=$(curl_https --fail -H "Authorization: Bearer $OCM_HOST_TOKEN" \
+    "$SOURCE/v1/provider/verify" 2>/dev/null) || {
+    REASON=$(curl_https -H "Authorization: Bearer $OCM_HOST_TOKEN" \
+      "$SOURCE/v1/provider/verify" 2>/dev/null \
+      | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+    die "${REASON:-could not reach $SOURCE to check the token}"
+  }
+  printf '%s' "$VERIFY" | grep -q '"ok":true' \
+    || die "the gateway response did not confirm this provider token"
+  printf '  token accepted\n'
+  CREDENTIAL="provider token, accepted by the gateway"
+else
+  printf 'checking the gateway …\n'
+  curl_https --fail "$SOURCE/install.sh.sha256" -o /dev/null 2>/dev/null \
+    || die "could not reach $SOURCE"
+  printf '  reachable\n'
+  if [ "$ENROLL_PENDING" = 1 ]; then
+    CREDENTIAL="enrollment code, left unspent; the real run exchanges it for a token bound to $AGENT_ID"
+  else
+    CREDENTIAL="none given; the real run prompts for one with typing hidden"
+  fi
+fi
 
 printf 'OCM provider install\n  host    %s (%s)\n  user    %s\n  gateway %s\n  serving %s\n\n' \
   "$AGENT_ID" "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo mac)" \
   "$RUN_USER" "$GATEWAY" "$MODEL_MAP"
+
+# Everything above only reads. A dry run says what the rest would do, then stops.
+if [ "$DRY_RUN" = 1 ]; then
+  if [ -r /etc/ocm/agent.env ]; then
+    EXISTING="reinstall over an agent currently enrolled as $(sed -n 's|^OCM_AGENT_ID=||p' /etc/ocm/agent.env | head -1)"
+  else
+    EXISTING="fresh install; there is no /etc/ocm/agent.env"
+  fi
+  if launchctl print system/com.ocm.agent >/dev/null 2>&1; then
+    DAEMON="loaded; it would be stopped and started again on the new files"
+  else
+    DAEMON="not loaded; it would be created and started"
+  fi
+  HUB="$RUN_HOME/.cache/huggingface/hub/models--$(printf '%s' "$MLX_MODEL" | sed 's|/|--|g')"
+  if [ -d "$HUB" ]; then
+    CACHE="present, $(du -sh "$HUB" 2>/dev/null | cut -f1); the installer does not touch it"
+  else
+    CACHE="absent; about 4.5 GB downloads on the first request, not during install"
+  fi
+  cat <<PLAN
+dry run
+  state       $EXISTING
+  credential  $CREDENTIAL
+  daemon      $DAEMON
+  region      ${REGION:-local}
+  uv          $UV
+  model       $HUB
+              $CACHE
+
+would write, as root
+  $PREFIX/agent/agent.py                      755, only after its --doctor passes as $RUN_USER
+  $PREFIX/bin/ocm-agent-run                   755, generated; holds no token
+  $PREFIX/bin/ocm-agent-token                 755
+  $PREFIX/bin/ocm-agent-update                755
+  $PREFIX/bin/ocm-agent-uninstall             755
+  /etc/ocm/agent.env                           600, owned by $RUN_USER; holds the token
+  /var/log/ocm-agent.log                       600, owned by $RUN_USER
+  /Library/LaunchDaemons/com.ocm.agent.plist   644, runs ocm-agent-run as $RUN_USER
+
+nothing else. Undo later with: sudo $PREFIX/bin/ocm-agent-uninstall
+
+dry run; nothing was changed
+PLAN
+  exit 0
+fi
 
 # Download to a private temporary file and prove the new agent's diagnostic path as
 # the same unprivileged account that launchd will use. Only then replace installed
@@ -459,6 +544,101 @@ OCM_HOST_TOKEN_FILE="$WORK/token" OCM_AGENT_ID="$AGENT_ID" OCM_MODEL_MAP="$MODEL
 UPD
 chmod 755 "$PREFIX/bin/ocm-agent-update"
 
+# Uninstall used to be a printed `rm -rf`, which nobody previews and which left the
+# model download behind. This removes exactly what the installer wrote, can be asked
+# what it would do first, and deletes the model only when told to, and only that model.
+cat > "$PREFIX/bin/ocm-agent-uninstall" <<'UNINST'
+#!/bin/sh
+# Remove the OCM provider agent from this Mac.
+#   sudo /opt/ocm/bin/ocm-agent-uninstall                 # stop and remove; keep the model
+#   sudo /opt/ocm/bin/ocm-agent-uninstall --dry-run       # list what would go; change nothing
+#   sudo /opt/ocm/bin/ocm-agent-uninstall --purge-cache   # also delete this model's download
+#
+# Removes what install.sh wrote and nothing else: the launchd daemon and its plist,
+# /opt/ocm, /etc/ocm and the log. The model download in the provider account's Hugging
+# Face cache is several GB and stays unless --purge-cache is given, and then only that
+# one model's directory goes, never the whole cache. The token is not printed and not
+# sent anywhere; this cannot revoke it, so revoke the credential in the console after.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+# The whole script is one function so it is parsed in full before /opt/ocm, and this
+# file with it, is removed from under it.
+main() {
+[ "$(id -u)" = "0" ] || { echo "run with sudo" >&2; exit 1; }
+DRY_RUN=0; PURGE=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --purge-cache) PURGE=1 ;;
+    *) echo "usage: ocm-agent-uninstall [--dry-run] [--purge-cache]" >&2; exit 1 ;;
+  esac
+done
+ENV=/etc/ocm/agent.env
+PLIST=/Library/LaunchDaemons/com.ocm.agent.plist
+LOG=/var/log/ocm-agent.log
+AGENT_ID="unknown (no $ENV)"; HUB=""
+if [ -r "$ENV" ]; then
+  AGENT_ID=$(sed -n 's|^OCM_AGENT_ID=||p' "$ENV" | head -1)
+  OWNER=$(stat -f '%Su' "$ENV" 2>/dev/null || true)
+  printf '%s\n' "$OWNER" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' || OWNER=""
+  # The advertised map names the model, e.g. ocm-coder=mlx-community/Qwen…-4bit, which
+  # Hugging Face keeps under hub/models--mlx-community--Qwen…-4bit in the owner's home.
+  MLX=$(sed -n 's|^OCM_MODEL_MAP=||p' "$ENV" | head -1 | sed -n 's|^[^=,]*=\([^,]*\).*|\1|p')
+  if [ -n "$OWNER" ] && [ "$OWNER" != root ] && [ -n "$MLX" ]; then
+    OWNER_HOME=$(dscl . -read "/Users/$OWNER" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')
+    HUB="$OWNER_HOME/.cache/huggingface/hub/models--$(printf '%s' "$MLX" | sed 's|/|--|g')"
+    # Only ever one model directory inside a hub cache, with a shape that cannot name
+    # anything else. Whatever does not fit is not ours to delete.
+    printf '%s\n' "$HUB" | LC_ALL=C grep -Eq '^/[-A-Za-z0-9._/+]+/\.cache/huggingface/hub/models--[-A-Za-z0-9._+]+$' \
+      || HUB=""
+    [ -n "$HUB" ] && [ -d "$HUB" ] || HUB=""
+  fi
+fi
+present() { if [ -e "$1" ]; then echo present; else echo absent; fi; }
+if launchctl print system/com.ocm.agent >/dev/null 2>&1; then DAEMON="loaded; will be stopped"
+else DAEMON="not loaded"; fi
+if [ -n "$HUB" ]; then
+  SIZE=$(du -sh "$HUB" 2>/dev/null | cut -f1)
+  if [ "$PURGE" = 1 ]; then CACHE="$HUB ($SIZE): will be deleted (--purge-cache)"
+  else CACHE="$HUB ($SIZE): kept; --purge-cache deletes it"; fi
+else
+  CACHE="no download found for this machine's model; nothing to purge"
+fi
+cat <<REPORT
+OCM provider uninstall
+  host    $AGENT_ID
+  daemon  $DAEMON
+  remove  $PLIST ($(present "$PLIST"))
+          /opt/ocm ($(present /opt/ocm))
+          /etc/ocm ($(present /etc/ocm))
+          $LOG ($(present "$LOG"))
+  model   $CACHE
+REPORT
+if [ "$DRY_RUN" = 1 ]; then
+  echo "dry run; nothing was changed"
+  exit 0
+fi
+# bootout is asynchronous; wait for the job to actually go, as the installer does.
+launchctl bootout system/com.ocm.agent 2>/dev/null || true
+n=0
+while launchctl print system/com.ocm.agent >/dev/null 2>&1 && [ "$n" -lt 50 ]; do
+  sleep 0.2; n=$((n + 1))
+done
+rm -f "$PLIST"
+rm -rf /opt/ocm /etc/ocm
+rm -f "$LOG"
+if [ "$PURGE" = 1 ] && [ -n "$HUB" ]; then rm -rf "$HUB"; fi
+cat <<DONE
+removed. The provider token this machine held is gone from disk but not revoked:
+revoke it in the console (Your credentials, $AGENT_ID) so the credential is dead and
+the name is free. uv and its cache were not installed by OCM and stay.
+DONE
+}
+main "$@"
+UNINST
+chmod 755 "$PREFIX/bin/ocm-agent-uninstall"
+
 # launchd opens the log as RUN_USER. Pre-create it owner-only rather than relying on
 # launchd to create a world-readable root log or failing because /var/log is closed.
 touch /var/log/ocm-agent.log
@@ -512,8 +692,8 @@ installed. Inference runs as $RUN_USER, never as root.
   rotate   sudo $PREFIX/bin/ocm-agent-token
   update   sudo $PREFIX/bin/ocm-agent-update      (--check to only look)
   stop     sudo launchctl bootout system/com.ocm.agent
-  remove   sudo launchctl bootout system/com.ocm.agent; sudo rm -rf $PREFIX /etc/ocm \\
-             /Library/LaunchDaemons/com.ocm.agent.plist /var/log/ocm-agent.log
+  remove   sudo $PREFIX/bin/ocm-agent-uninstall   (--dry-run to only look; --purge-cache
+             to also delete this model's download, which otherwise stays)
 
 Your Mac should appear in the console within a few seconds.
 
