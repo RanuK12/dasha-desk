@@ -81,7 +81,13 @@ test('provider capability claims are bounded and unknown identity fields are dro
     region: 'us-west',
     runtime: 'mlx',
     memory_gb: 128,
+    build: null,
   });
+  // The build is a SHA-256 of agent.py or nothing; a version string is not accepted.
+  const sha = 'a'.repeat(64);
+  assert.equal(normalizeProviderAgent({ id: 'x', models: ['ok'], build: sha }).build, sha);
+  assert.throws(() => normalizeProviderAgent({ id: 'x', models: ['ok'], build: '1.2.3' }), /build must be/);
+  assert.throws(() => normalizeProviderAgent({ id: 'x', models: ['ok'], build: 'A'.repeat(64) }), /build must be/);
   assert.throws(() => normalizeProviderAgent({ id: 'bad id', models: ['x'] }), /agent id/);
   assert.throws(() => normalizeProviderAgent({ id: 'x', models: [] }), /models must contain/);
   assert.throws(() => normalizeProviderAgent({

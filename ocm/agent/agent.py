@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import platform
@@ -37,6 +38,23 @@ HOST_TOKEN = os.getenv("OCM_HOST_TOKEN", "host-dev-token")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 AGENT_ID = os.getenv("OCM_AGENT_ID") or f"{platform.node().split('.')[0]}-{os.getpid()}"
 REGION = os.getenv("OCM_REGION", "local")
+
+
+def _self_sha256():
+    """This agent's version: the SHA-256 of the file it is running from.
+
+    The gateway hashes the agent.py it serves the same way. Equal means current;
+    anything else means `ocm-agent-update` has work to do. A hash cannot be forgotten
+    at release time the way a version number can.
+    """
+    try:
+        with open(__file__, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:                        # noqa: BLE001
+        return None
+
+
+AGENT_BUILD = _self_sha256()
 MAX_BACKOFF = 60.0
 
 
@@ -102,6 +120,7 @@ def capabilities(models):
         "memory_gb": mem,
         "region": REGION,
         "runtime": RUNTIME.name,
+        "build": AGENT_BUILD,
         "models": models,
         # thermal_headroom needs `powermetrics` (root) — deliberately omitted rather
         # than faked; the gateway treats it as optional.
@@ -392,6 +411,19 @@ def doctor():
     if caps["arch"] != "arm64":
         print("          note: not Apple Silicon — MLX is unavailable on this machine")
     print(f"gateway   {GATEWAY_URL}")
+    # Build check: the one-command update exists; this is what says when to run it.
+    # Informational only — an old build still serves, so it does not fail the doctor.
+    print(f"build     {(AGENT_BUILD or 'unknown')[:12]}", end="", flush=True)
+    try:
+        with urllib.request.urlopen(f"{_http_base()}/agent.py.sha256", timeout=15) as r:
+            served = r.read().decode().split()[0]
+        if served == AGENT_BUILD:
+            print(" — current")
+        else:
+            print(f" — UPDATE AVAILABLE ({served[:12]} is served)")
+            print("          run: sudo /opt/ocm/bin/ocm-agent-update")
+    except Exception as exc:                 # noqa: BLE001
+        print(f" — could not compare with the gateway: {exc}")
     # The check that matters. A local runtime that works proves nothing about
     # whether this machine is allowed to join the network.
     good, detail = verify_token()

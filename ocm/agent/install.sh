@@ -682,9 +682,13 @@ fi
 rm -f "$TMP_AGENT"
 trap - EXIT HUP INT TERM
 
+# The build is the agent file's SHA-256; the doctor, the console and the status page
+# compare it with what the gateway serves and say when an update is available.
+BUILD=$(shasum -a 256 "$PREFIX/agent/agent.py" | cut -c1-12)
+
 cat <<DONE
 
-installed. Inference runs as $RUN_USER, never as root.
+installed. Agent build $BUILD. Inference runs as $RUN_USER, never as root.
 
   status   launchctl print system/com.ocm.agent
   logs     tail -f /var/log/ocm-agent.log

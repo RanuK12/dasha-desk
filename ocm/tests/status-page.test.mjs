@@ -11,6 +11,8 @@ import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { createGateway } from '../gateway/server.mjs';
 import { Ledger, startOfUtcDay } from '../gateway/ledger.mjs';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const CONSOLE_HOST = 'console.test.invalid';
 
@@ -34,7 +36,7 @@ async function startGateway() {
 }
 
 /** A stub provider that connects the way a real one does: header auth, then hello. */
-async function connectHost(gw, id, models) {
+async function connectHost(gw, id, models, extra = {}) {
   const cred = await gw.accounts.issue(gw.hostAccountId, 'provider_token', `stub ${id}`);
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`${gw.wsBase}/host/connect`,
@@ -42,7 +44,7 @@ async function connectHost(gw, id, models) {
     ws.addEventListener('error', reject);
     ws.addEventListener('open', () => {
       ws.send(JSON.stringify({ t: 'hello',
-        agent: { id, models, chip: 'Apple M-stub', memory_gb: 24, region: 'local' } }));
+        agent: { id, models, chip: 'Apple M-stub', memory_gb: 24, region: 'local', ...extra } }));
     });
     ws.addEventListener('message', (ev) => {
       const msg = JSON.parse(ev.data);
@@ -153,4 +155,63 @@ test('servedToday uses a UTC day boundary on the JSONL ledger', async () => {
   assert.equal(t.requests, 1);
   assert.equal(t.prompt_tokens, 3);
   assert.equal(t.completion_tokens, 4);
+});
+
+test('each host is shown against the agent build this gateway serves (P2)', async () => {
+  // The version is the SHA-256 of agent.py. A host that reports the served hash is
+  // current; a different hash, or none at all (an agent from before builds were
+  // reported), means the one-command update is due. The public surfaces say so
+  // without any account identity.
+  const served = createHash('sha256')
+    .update(readFileSync(new URL('../agent/agent.py', import.meta.url))).digest('hex');
+  const gw = await startGateway();
+  const sockets = [];
+  try {
+    sockets.push(await connectHost(gw, 'current-mac', ['ocm-coder'], { build: served }));
+    sockets.push(await connectHost(gw, 'stale-mac', ['ocm-coder'], { build: 'b'.repeat(64) }));
+    sockets.push(await connectHost(gw, 'old-mac', ['ocm-coder']));
+
+    const sha = await get(gw.port, '/agent.py.sha256');
+    assert.equal(sha.status, 200);
+    assert.equal(sha.body, `${served}  agent.py\n`, 'shasum -c shape, and the hash of the file actually served');
+
+    const net = JSON.parse((await get(gw.port, '/v1/network')).body);
+    assert.equal(net.agent_build, served.slice(0, 12));
+    const byId = Object.fromEntries(net.hosts.map((h) => [h.id, h]));
+    assert.deepEqual(
+      { c: byId['current-mac'].build_state, s: byId['stale-mac'].build_state, o: byId['old-mac'].build_state },
+      { c: 'current', s: 'stale', o: 'unreported' });
+    assert.equal(byId['current-mac'].build, served.slice(0, 12));
+    assert.equal(byId['stale-mac'].build, 'bbbbbbbbbbbb');
+    assert.equal(byId['old-mac'].build, null);
+    assert.doesNotMatch(JSON.stringify(net), /acct_|@/, 'still no account identity');
+
+    const page = (await get(gw.port, '/console/status')).body;
+    assert.match(page, new RegExp(`current-mac[\\s\\S]*?<code>${served.slice(0, 12)}</code> <span class="muted">current</span>`));
+    assert.match(page, /stale-mac[\s\S]*?<code>bbbbbbbbbbbb<\/code> <span class="warn-text">update available<\/span>/);
+    assert.match(page, /old-mac[\s\S]*?unreported<\/span> <span class="warn-text">update available<\/span>/);
+    assert.match(page, /one command/);
+    assert.doesNotMatch(page, /[\w.+-]+@[\w-]+\.[\w.]+/);
+  } finally {
+    for (const ws of sockets) ws.close();
+    await gw.close();
+  }
+});
+
+test('a hello with a malformed build is refused like any other bad claim', async () => {
+  const gw = await startGateway();
+  try {
+    await assert.rejects(async () => {
+      const cred = await gw.accounts.issue(gw.hostAccountId, 'provider_token', 'bad build');
+      await new Promise((resolve, reject) => {
+        const ws = new WebSocket(`${gw.wsBase}/host/connect`, { headers: { authorization: `Bearer ${cred.secret}` } });
+        ws.addEventListener('open', () => ws.send(JSON.stringify({ t: 'hello',
+          agent: { id: 'bad-build', models: ['ocm-coder'], build: 'v1.2.3' } })));
+        ws.addEventListener('close', (ev) => reject(new Error(`closed ${ev.code} ${ev.reason}`)));
+        ws.addEventListener('message', (ev) => { if (JSON.parse(ev.data).t === 'welcome') resolve(ws); });
+      });
+    }, /closed 1008 invalid provider capabilities/);
+  } finally {
+    await gw.close();
+  }
 });

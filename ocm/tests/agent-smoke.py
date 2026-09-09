@@ -47,6 +47,11 @@ check("MlxRuntime constructs", lambda: agent.MlxRuntime())
 check("OllamaRuntime constructs", lambda: agent.OllamaRuntime())
 
 # capabilities() reads platform details and must not explode on any host.
+# The build is the SHA-256 of the running file; the gateway refuses any other shape.
+check("capabilities() reports the agent's build as a 64-hex SHA-256",
+      lambda: __import__("re").fullmatch(r"[a-f0-9]{64}", agent.capabilities([])["build"] or "")
+      or (_ for _ in ()).throw(AssertionError(agent.capabilities([])["build"])))
+
 check("capabilities() returns a dict",
       lambda: isinstance(agent.capabilities([]), dict) or (_ for _ in ()).throw(
           AssertionError("not a dict")))
