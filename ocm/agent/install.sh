@@ -77,7 +77,7 @@ else
   PLATFORM_UUID=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | sed -n 's/.*"IOPlatformUUID" = "\(.*\)"/\1/p' | head -1)
   [ -n "$PLATFORM_UUID" ] || { printf '\nerror: could not read the hardware id; set OCM_AGENT_ID to name this machine\n' >&2; exit 1; }
   HWID=$(printf '%s' "$PLATFORM_UUID" | shasum -a 256 | cut -c1-6)
-  HOST_SHORT=$(hostname -s | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-\n' '-' | cut -c1-56)
+  HOST_SHORT=$(hostname -s | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._\n-' '-' | cut -c1-56)
   AGENT_ID="${HOST_SHORT:-mac}-$HWID"
   AGENT_ID_FROM="hostname + hardware id"
 fi
