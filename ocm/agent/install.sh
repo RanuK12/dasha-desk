@@ -39,9 +39,11 @@
 #   sudo sh install.sh < /path/to/token
 #
 # Optional:
-#   OCM_AGENT_ID="my-mac"   the name this machine registers under; defaults to the
-#                           hostname. Keep it stable, or a reinstall registers a
-#                           second host instead of recovering the first.
+#   OCM_AGENT_ID="my-mac"   the name this machine registers under. Optional: a
+#                           reinstall keeps the name already in /etc/ocm/agent.env,
+#                           and a first install defaults to the hostname plus six
+#                           characters derived from the hardware id (mb1-2c9265),
+#                           so two Macs with the same hostname cannot register as one.
 #   OCM_MODEL_MAP="public=local,…"  what this machine advertises. Defaults to
 #                           ocm-coder=<the MLX coder model>, which is the name
 #                           consumers actually request.
@@ -62,10 +64,24 @@ GATEWAY="${OCM_GATEWAY_URL:-wss://api.ocm.getdasha.com}"
 # second arbitrary source URL previously allowed a token to be checked against one
 # deployment while root downloaded executable code from another.
 SOURCE=$(printf '%s\n' "$GATEWAY" | sed 's|^wss://|https://|')
-# Set OCM_AGENT_ID to keep a machine's identity stable across reinstalls. Without it
-# this defaults to the hostname, and a reinstall that produces a different name
-# registers a SECOND host rather than recovering the existing one.
-AGENT_ID="${OCM_AGENT_ID:-$(hostname -s)}"
+# The machine's name, in order: OCM_AGENT_ID if given; the name already recorded in
+# /etc/ocm/agent.env, so a reinstall recovers the existing host instead of registering
+# a second one; otherwise the hostname plus six hex characters derived from the
+# hardware id, so identically named Macs cannot collide. The suffix is a hash of the
+# platform UUID and never the serial number: the name is published on /v1/network.
+# --- name default (begin)
+AGENT_ID="${OCM_AGENT_ID:-$(sed -n 's|^OCM_AGENT_ID=||p' /etc/ocm/agent.env 2>/dev/null | head -1)}"
+if [ -n "$AGENT_ID" ]; then
+  if [ -n "${OCM_AGENT_ID:-}" ]; then AGENT_ID_FROM="OCM_AGENT_ID"; else AGENT_ID_FROM="kept from /etc/ocm/agent.env"; fi
+else
+  PLATFORM_UUID=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | sed -n 's/.*"IOPlatformUUID" = "\(.*\)"/\1/p' | head -1)
+  [ -n "$PLATFORM_UUID" ] || { printf '\nerror: could not read the hardware id; set OCM_AGENT_ID to name this machine\n' >&2; exit 1; }
+  HWID=$(printf '%s' "$PLATFORM_UUID" | shasum -a 256 | cut -c1-6)
+  HOST_SHORT=$(hostname -s | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-\n' '-' | cut -c1-56)
+  AGENT_ID="${HOST_SHORT:-mac}-$HWID"
+  AGENT_ID_FROM="hostname + hardware id"
+fi
+# --- name default (end)
 # What this machine ADVERTISES to consumers. Without a map an MLX host advertises
 # the raw model id, which no consumer asks for — the docs, the console and every
 # example say `ocm-coder`, so a provider installed by this script was invisible to
@@ -282,6 +298,7 @@ if [ "$DRY_RUN" = 1 ]; then
   fi
   cat <<PLAN
 dry run
+  name        $AGENT_ID ($AGENT_ID_FROM)
   state       $EXISTING
   credential  $CREDENTIAL
   daemon      $DAEMON

@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { renderProviderGuide } from '../gateway/console.mjs';
 
@@ -432,4 +435,46 @@ test('the uninstaller removes exactly what the installer wrote and can preview t
   assert.match(guide, /sudo \/opt\/ocm\/bin\/ocm-agent-uninstall/);
   assert.match(guide, /--purge-cache/);
   assert.match(guide, /Remove later with: sudo \/opt\/ocm\/bin\/ocm-agent-uninstall/);
+});
+
+test('the machine name is kept on reinstall and otherwise derived from the hardware id (P3)', () => {
+  // Precedence: OCM_AGENT_ID, then the name already on disk, then hostname + a hash
+  // of the platform UUID. The old default was the bare hostname, so a household of
+  // identically named Macs registered as one, and a reinstall without OCM_AGENT_ID
+  // registered a second host instead of recovering the first.
+  assert.match(source, /AGENT_ID="\$\{OCM_AGENT_ID:-\$\(sed -n 's\|\^OCM_AGENT_ID=\|\|p' \/etc\/ocm\/agent\.env 2>\/dev\/null \| head -1\)\}"/,
+    'an explicit name wins, then the one already recorded on this machine');
+  assert.match(source, /IOPlatformUUID/);
+  assert.doesNotMatch(source, /IOPlatformSerialNumber|hw\.serial|serialnumber/i,
+    'the name is public on /v1/network; a device serial must never be part of it');
+  assert.match(source, /shasum -a 256 \| cut -c1-6/, 'the suffix is a hash, not the UUID itself');
+  const begin = source.indexOf('# --- name default (begin)\n');
+  const end = source.indexOf('# --- name default (end)\n');
+  assert.ok(begin > 0 && end > begin);
+  const snippet = source.slice(begin, end);
+  assert.equal((source.match(/hostname -s/g) || []).length, 1, 'the hostname is used only inside the fallback');
+  assert.ok(snippet.includes('hostname -s'));
+  // The dry run says where the name came from.
+  assert.match(source, /name        \$AGENT_ID \(\$AGENT_ID_FROM\)/);
+
+  // Run the fallback for real, with a fake ioreg and hostname on PATH and no env file,
+  // and check the derived name byte for byte.
+  const dir = mkdtempSync(join(tmpdir(), 'ocm-name-'));
+  const uuid = '9E1C7A2B-1234-4ABC-9DEF-0123456789AB';
+  writeFileSync(join(dir, 'ioreg'), `#!/bin/sh\nprintf '    | |   "IOPlatformUUID" = "${uuid}"\\n'\n`, { mode: 0o755 });
+  writeFileSync(join(dir, 'hostname'), '#!/bin/sh\necho "Michaels MacBook Air"\n', { mode: 0o755 });
+  const expected = `michaels-macbook-air-${createHash('sha256').update(uuid).digest('hex').slice(0, 6)}`;
+  const run = (env) => spawnSync('sh', ['-c', `${snippet}\nprintf '%s|%s' "$AGENT_ID" "$AGENT_ID_FROM"`],
+    { encoding: 'utf8', env: { PATH: `${dir}:/usr/bin:/bin`, ...env } });
+  let r = run({});
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, `${expected}|hostname + hardware id`);
+  assert.match(expected, /^[-a-z0-9._]{1,64}$/, 'the derived name passes the installer allowlist');
+  r = run({ OCM_AGENT_ID: 'chosen-name' });
+  assert.equal(r.stdout, 'chosen-name|OCM_AGENT_ID');
+  // No ioreg at all: refuse with advice rather than inventing a name.
+  writeFileSync(join(dir, 'ioreg'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  r = run({});
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /could not read the hardware id; set OCM_AGENT_ID/);
 });
