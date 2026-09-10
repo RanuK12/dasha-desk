@@ -224,7 +224,8 @@ sudo OCM_AGENT_ID="${esc(id)}" sh install.sh</pre>
 <p>The installer asks for this code with typing hidden, exchanges it for a provider token
 that only this machine can use, and never shows you that token. If this machine was
 enrolled before under the same name, its previous token is revoked in the same step, so
-re-enrolling is how you rotate. Keep <code>OCM_AGENT_ID</code> the same every time.</p>
+re-enrolling is how you rotate. A reinstall keeps the name already on the machine, so
+<code>OCM_AGENT_ID</code> is only needed the first time.</p>
 <p class="muted">A code that expires unused is harmless; issue another. Automation that
 needs a long-lived credential can still use <strong>New provider token</strong>.</p>
 <p><a href="/">Back to the console</a></p>`);
@@ -606,9 +607,11 @@ export function renderProviderGuide({ account = null, apiHost, models, admin = f
   <p class="cap">It asks for your enrollment code (or a provider token) with typing hidden,
   so nothing lands in shell history or the process list. Do not put either on the command
   line. The code is exchanged and the resulting token checked against the gateway before
-  anything is written, so a bad one fails here with the reason. Keep
-  <code>OCM_AGENT_ID</code> the same on every reinstall: it is the name the token is bound
-  to, and a different name registers a second provider instead of recovering the first.</p>
+  anything is written, so a bad one fails here with the reason.
+  <code>OCM_AGENT_ID</code> is the name the token is bound to. A reinstall keeps the name
+  already on the machine. Leave it out on a first install and the Mac is named after its
+  hostname plus six characters derived from its hardware id, so two Macs called the same
+  thing cannot register as one.</p>
 </div>
 
 <div class="step">
@@ -677,7 +680,9 @@ visible to any local user through ps. The installer asks for it with typing hidd
 If you cannot drive an interactive prompt, ask the user to run that one line and
 paste the token when asked. Do not work around the prompt.
 
-Keep OCM_AGENT_ID identical on every reinstall or the machine registers twice.
+OCM_AGENT_ID is optional: a reinstall keeps the machine's existing name, and a first
+install defaults to the hostname plus a hardware-derived suffix, so identically named
+Macs cannot collide. Set it only to choose a name.
 Inference runs as the invoking user, not root.
 Confirm with: /opt/ocm/bin/ocm-agent-run --doctor   (expect: token ok)
 The first request takes up to ~90s while the model loads. That is not a fault.

@@ -548,8 +548,8 @@ appear in shell history and the process list.</p>
 <pre>read -rsp "Provider token: " OCM_HOST_TOKEN
 printf '\\n'
 sudo --preserve-env=OCM_HOST_TOKEN${agentId ? ` OCM_AGENT_ID="${agentId}"` : ''} sh install.sh</pre>
-${agentId ? `<p class="muted">Keep <code>OCM_AGENT_ID</code> the same on every reinstall of this
-machine — a different name registers a second provider instead of recovering this one.</p>` : ''}
+${agentId ? `<p class="muted"><code>OCM_AGENT_ID</code> is the name this token binds to. A reinstall keeps
+the name already on the machine, so it is only needed the first time.</p>` : ''}
 <p class="muted">See <a href="/provider">Run a provider</a> for the full guide.</p>`
               : `<pre>export OPENAI_BASE_URL="https://${apiHost}/v1"
 export OPENAI_API_KEY="${cred.secret}"</pre>`,
