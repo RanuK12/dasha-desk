@@ -22,6 +22,8 @@ This is a **docs-only** report. No production code was changed. Do not merge #44
 
 Independent read of `ocm/gateway/*`, `ocm/agent/*`, `ocm/scripts/*`, `ocm/tests/*`, and `ocm/docs/PROVIDER-PROTOCOL.md`. Findings below are from source, not from prior PR prose. Several helper modules (`quota.mjs`, `request.mjs`) exist on disk but are **not imported** by `server.mjs`.
 
+Fleet hunt (2026-09-11T12:35Z): live GET of `/compute/ocm/provider/status` and `/provider/healthz` vs canonical `/healthz` and `/status`. See P2-14.
+
 Commands not run as a merge gate: `cd ocm && npm test` was not required for a docs-only report. Existing tests already cover the “looks solid” items.
 
 ## Severity legend
@@ -66,6 +68,20 @@ Commands not run as a merge gate: `cd ocm && npm test` was not required for a do
 | P2-11 | `whatNext` HTML interpolates secrets unescaped | `renderSecret` escapes the primary `<code>` (`console.mjs:205-209`) but signup/recovery `whatNext` embeds `${cred.secret}` raw (`server.mjs:426-431`, `488-490`). Secrets are base64url today. | Escape or pass structured fields. |
 | P2-12 | `ocm-agent-token` rewrites `agent.env` non-atomically | `grep` + redirect + `cat` (`install.sh:469-471`). Crash mid-write can truncate the env file. | `mv` from a same-dir temp, as the agent download already does. |
 | P2-13 | Hosts advertise models before Metal load | Agent `hello` uses `RUNTIME.models()` without loading (`agent.py:347-353`). Gateway marks warm only after first chunk (`server.mjs:922-924`). Routing prefers warm hosts; overflow still hits cold (`MAX_INFLIGHT_PER_HOST = 2`). | Optional preload or a `ready` bit. Documented alpha, but it is the main consumer-latency cost. |
+| P2-14 | `GET /provider/status` and `/provider/healthz` 404; agents probe the wrong paths | Gateway has no those predicates. Liveness is `GET /healthz` (`server.mjs:670-677`). Public HTML status is console `GET /status` (`378-380`) or `/console/status` on any host. API-host `GET /status` is deliberately 404 (`status-page.test.mjs:124-126`). Unmatched paths fall through to `no route for GET …` (`759`). Live 2026-09-11T12:35Z: www `/compute/ocm/provider/status` and `/compute/ocm/provider/healthz` → **404** `no route for GET /provider/status` (and `…/healthz`); `/compute/ocm/healthz` **200** `{"ok":true,"service":"ocm-gateway"}`; `/compute/ocm/status` **200** HTML. Same 404s on `api.ocm.getdasha.com` and `ocm.getdasha.com`. Route inventory lists `/healthz` and `/console/status` only (`route-inventory.test.mjs:41-62`). Provider guide nav links `/status`, not `/provider/status` (`console.mjs:199`). | **Either** add thin aliases (`/provider/status` → `renderStatus`, `/provider/healthz` → same JSON as `/healthz`) and declare them in the route inventory, **or** document the canonical URLs in the provider guide / `/provider` page so naive probes stop guessing. Do not invent a third health contract. See table below. |
+
+#### P2-14 canonical URLs (agents and lobby proxy)
+
+The live Worker prefixes OCM with `/compute/ocm` (`x-dasha-edge: compute-ocm`) and strips that prefix before the gateway. So `/compute/ocm/provider` is the recruiting guide (`/provider`), and `/compute/ocm/provider/status` is **not** “status of the provider page” — it is a non-route `/provider/status`.
+
+| Intent | Canonical gateway path | Live (www prefix) | Do not use |
+| --- | --- | --- | --- |
+| Liveness JSON | `GET /healthz` | `/compute/ocm/healthz` (also `api.ocm.getdasha.com/healthz`) | `/provider/healthz`, `/compute/ocm/provider/healthz` |
+| Public status HTML | `GET /status` on the **console** host; `GET /console/status` on any host | `/compute/ocm/status`, `ocm.getdasha.com/status` | `/provider/status`, `/compute/ocm/provider/status` |
+| Public status JSON | `GET /v1/network` | `/compute/ocm/v1/network` | guessing under `/provider/…` |
+| Provider guide | `GET /provider` (console) | `/compute/ocm/provider` | — |
+
+`/status` on the **API** host is 404 by design (`status-page.test.mjs:124-126`). Probes that hit `api.ocm.getdasha.com/status` should use `/healthz` or `/v1/network`.
 
 ### P3
 
@@ -147,6 +163,7 @@ GRAHAM-INTEGRATE lock: **do not** restyle the OCM console login or invent a new 
 7. Agents have HTML forms + cookie for enroll/revoke/redeem. First-class REST is `/admin/*` (bearer) only. A lobby proxy should call admin or a future account API, not scrape the console.
 8. Session lasts 12 hours (`session.mjs:19`). Revoking the key used to sign in also kills the browser session — correct, surprising.
 9. `/provider` already contains the agent prompt in `<details>`. Installer still needs a human at the hidden prompt; full unattended enroll is not claimed.
+10. **Health/status probes:** use `/healthz` and `/status` (or `/console/status`), not `/provider/status` or `/provider/healthz` (P2-14). A lobby proxy that only documents `/compute/ocm/provider` will keep attracting `/provider/status` guesses.
 
 Lobby-proxy sketch (not in this PR): getdasha `/login` session → server-side `POST /admin/credentials` or a new `POST /v1/console/exchange` → `Set-Cookie: ocm_session`. That keeps OCM’s HMAC cookie and revoke-by-credential-id behavior.
 
@@ -159,11 +176,12 @@ Do not start these from this PR. Each is one claim.
 1. **P1-5** session-secret / admin-token split (one file, deploy-script already correct).
 2. **P1-2** wire `normalizeChatRequest` + tests for tools / oversized messages.
 3. **P1-1** wire `QuotaReservations` + a concurrent-overdraw test.
-4. **P2-5** cancel → terminal + e2e (protocol gate #5).
-5. **P2-4** invite grant only when a configured code matches.
-6. **P2-7 / P2-8** installer: checksum `agent.py`; keep verify token off argv.
-7. Rate limits (P1-4) at the ALB or a tiny in-process bucket — before inviting strangers to `/signin`.
-8. Accounting fail-closed at the HTTP boundary (P1-3) before any money language.
+4. **P2-14** thin `/provider/status` + `/provider/healthz` aliases **or** one sentence on the provider guide naming `/healthz` and `/status`. Cheap; stops fleet 404s. Do not change the `/healthz` JSON shape.
+5. **P2-5** cancel → terminal + e2e (protocol gate #5).
+6. **P2-4** invite grant only when a configured code matches.
+7. **P2-7 / P2-8** installer: checksum `agent.py`; keep verify token off argv.
+8. Rate limits (P1-4) at the ALB or a tiny in-process bucket — before inviting strangers to `/signin`.
+9. Accounting fail-closed at the HTTP boundary (P1-3) before any money language.
 
 ---
 
