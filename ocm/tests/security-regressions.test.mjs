@@ -198,3 +198,76 @@ test('invalid fragmented and binary provider messages are rejected explicitly', 
   void interrupted;
   void binary;
 });
+
+// ---- 2026-09-11 review (docs/REVIEW-BUGS-SPEED-2026-09-11.md), batch 1 ----------------
+
+import { clearCookieHeader } from '../gateway/session.mjs';
+
+async function reviewGateway(opts = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'ocm-review-'));
+  return createGateway({ secureCookies: false, ledgerPath: join(dir, 'usage.jsonl'), modelAliases: '', grantTokens: 5_000, ...opts });
+}
+
+test('P1-5: the admin bearer token cannot sign a console session', async () => {
+  const admin = ['admin', 'bearer', 'for-test'].join('-');
+  // No sessionSecret given: the old default fell back to the admin token here.
+  const gw = await reviewGateway({ adminToken: admin });
+  const base = await listen(gw);
+  try {
+    const acct = await gw.accounts.createAccount('forge@example.test');
+    const cred = await gw.accounts.issue(acct.id, 'developer_key', 'k');
+    const forged = issueSession(admin, acct.id, cred.id);
+    const res = await fetch(`${base}/console/`, { headers: { cookie: `ocm_session=${forged}` }, redirect: 'manual' });
+    const body = await res.text();
+    assert.doesNotMatch(body, /Your balance|<h2>Credentials<\/h2>|Sign out/, 'a cookie signed with the admin token must not open a dashboard');
+    assert.match(body, /Sign in|Create account/, 'the anonymous landing is what it gets');
+    // And the admin route itself still works with the real token, and not with a near miss.
+    const ok = await fetch(`${base}/admin/accounts`, { method: 'POST', headers: { authorization: `Bearer ${admin}`, 'content-type': 'application/json' }, body: JSON.stringify({ email: 'made@example.test' }) });
+    assert.notEqual(ok.status, 401);
+    const near = await fetch(`${base}/admin/accounts`, { method: 'POST', headers: { authorization: `Bearer ${admin}x` }, body: '{}' });
+    assert.equal(near.status, 401);
+  } finally { await gw.close(); }
+});
+
+test('P2-2: an unhandled error answers a generic 500 and never echoes the message', async () => {
+  const gw = await reviewGateway({ adminToken: 'adm-' + 'x'.repeat(12), consoleHost: 'console.test.invalid' });
+  const base = await listen(gw);
+  try {
+    gw.ledger.summary = async () => { throw new Error('ECONNREFUSED /var/lib/secret-path'); };
+    const res = await fetch(`${base}/console/status`);
+    assert.equal(res.status, 500);
+    const body = await res.text();
+    assert.doesNotMatch(body, /secret-path|ECONNREFUSED/, 'internal detail must stay in the journal');
+    assert.match(body, /internal error/);
+    // A malformed body on an admin route is the caller's fault, not a 500.
+    const bad = await fetch(`${base}/admin/accounts`, { method: 'POST', headers: { authorization: 'Bearer adm-' + 'x'.repeat(12), 'content-type': 'application/json' }, body: '{not json' });
+    assert.equal(bad.status, 400);
+    assert.match(await bad.text(), /body must be JSON/);
+  } finally { await gw.close(); }
+});
+
+test('P2-4: tokens are granted only when a configured invite code matches', async () => {
+  const gw = await reviewGateway();   // no inviteCode configured
+  const base = await listen(gw);
+  try {
+    const wrong = await form(base, '/signup', { email: 'typed@example.test', invite: 'anything' });
+    assert.equal(wrong.status, 302);
+    assert.match(wrong.headers.get('location'), /not\+valid|not%20valid/, 'text in the invite box is refused when no code is configured');
+    const plain = await form(base, '/signup', { email: 'plain@example.test' });
+    assert.equal(plain.status, 200, 'signup without a code still works');
+    const acct = (await gw.accounts.listAccounts()).find((a) => a.email === 'plain@example.test');
+    assert.equal(await gw.ledger.balance(acct.id), 0, 'no grant without a configured code');
+    const cookie = (plain.headers.get('set-cookie') || '').split(';')[0];
+    const redeem = await fetch(`${base}/console/redeem`, { method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie }, body: 'invite=anything' });
+    assert.equal(redeem.status, 302);
+    assert.match(redeem.headers.get('location'), /error=/);
+    assert.equal(await gw.ledger.balance(acct.id), 0, 'redeem cannot grant either');
+  } finally { await gw.close(); }
+});
+
+test('P3-1: clearing the session cookie carries the same Secure attribute as setting it', () => {
+  assert.match(clearCookieHeader({ secure: true }), /; Secure$/);
+  assert.doesNotMatch(clearCookieHeader({ secure: false }), /Secure/);
+  assert.match(clearCookieHeader(), /; Secure$/, 'secure by default, like cookieHeader');
+});

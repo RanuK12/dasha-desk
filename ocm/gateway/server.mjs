@@ -12,7 +12,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
 import { createMailer, recoveryMessage, maskEmail } from './mail.mjs';
@@ -21,6 +21,10 @@ import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie,
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
 import { AGENT_DIR, installSha256, agentSha256, shortBuild, buildState } from './agentfiles.mjs';
+
+// For the few places a secret or host name is interpolated into console HTML outside
+// console.mjs. Secrets are base64url today; escape anyway (review P2-11).
+const escHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 const HEARTBEAT_MS = 30_000;
 const HOST_TIMEOUT_MS = 90_000;
@@ -245,7 +249,10 @@ export function publicAccountingHealth(ledger) {
 
 export async function createGateway({
   inviteCode = process.env.OCM_INVITE_CODE || '',
-  sessionSecret = process.env.OCM_SESSION_SECRET || process.env.OCM_ADMIN_TOKEN || 'dev-session-secret',
+  // Never the admin bearer as a fallback: a session secret that equals the admin
+  // token lets that token forge any user's console cookie (review P1-5). Without a
+  // durable secret, sessions are signed with a per-process key and die on restart.
+  sessionSecret = process.env.OCM_SESSION_SECRET || 'dev-session-secret',
   secureCookies = process.env.OCM_INSECURE_COOKIES !== '1',
   adminToken = process.env.OCM_ADMIN_TOKEN || '',
   // Console accounts allowed to see the network-wide view. Comma-separated emails;
@@ -272,6 +279,13 @@ export async function createGateway({
   mailer = null,
 } = {}) {
   const mail = mailer || (recoveryEnabled ? createMailer() : null);
+  // Constant-time, like every other credential check here (review P2-3).
+  const adminOk = (given) => {
+    if (!adminToken || typeof given !== 'string' || !given) return false;
+    const a = Buffer.from(given, 'utf8');
+    const b = Buffer.from(adminToken, 'utf8');
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
   const registry = new Registry(parseAliases(modelAliases));
   const admins = new Set(String(adminEmails).split(',').map((e) => e.trim().toLowerCase()).filter(Boolean));
   const isAdmin = (account) => !!account && admins.has(account.email.toLowerCase());
@@ -330,7 +344,7 @@ export async function createGateway({
         if (claim && await accounts.credentialActive(claim.credentialId)) {
           account = await accounts.accountFor(claim.accountId);
         } else if (claim) {
-          res.setHeader('set-cookie', clearCookieHeader());
+          res.setHeader('set-cookie', clearCookieHeader({ secure: secureCookies }));
         }
 
         if (req.method === 'GET' && consolePath === '/') {
@@ -404,7 +418,10 @@ export async function createGateway({
           // still refused outright, because silently creating a useless account
           // would leave someone wondering why nothing works.
           const offered = (f.invite || '').trim();
-          if (offered && inviteCode && offered !== inviteCode) {
+          // Tokens are granted only when a CONFIGURED code matches. With no code
+          // configured, any text in the box used to grant (review P2-4); now it is
+          // refused like any other wrong code.
+          if (offered && (!inviteCode || offered !== inviteCode)) {
             return redirect(res, '/?error=' + encodeURIComponent('That invite code is not valid.'));
           }
           let acct;
@@ -417,7 +434,7 @@ export async function createGateway({
             }
             throw err;
           }
-          const granted = offered && (!inviteCode || offered === inviteCode)
+          const granted = !!offered && !!inviteCode && offered === inviteCode
             && (await ledger.grantCount(acct.id)) === 0;
           if (granted) await ledger.grant(acct.id, grantTokens, 'invite grant');
           const cred = await accounts.issue(acct.id, 'developer_key', 'first key');
@@ -427,8 +444,8 @@ export async function createGateway({
             title: 'Your developer key',
             secret: cred.secret,
             whatNext: `<p>Point any OpenAI client at the gateway:</p>
-<pre>export OPENAI_BASE_URL="https://${apiHost}/v1"
-export OPENAI_API_KEY="${cred.secret}"</pre>
+<pre>export OPENAI_BASE_URL="https://${escHtml(apiHost)}/v1"
+export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>
 ${granted
   ? `<p class="muted">You have ${grantTokens.toLocaleString('en-US')} granted tokens. These are credits, not money.</p>`
   : `<div class="note warn"><strong>Your balance is zero.</strong> The account exists and
@@ -503,7 +520,7 @@ You are signed in with this one.</p>`,
         }
 
         if (req.method === 'POST' && consolePath === '/signout') {
-          res.setHeader('set-cookie', clearCookieHeader());
+          res.setHeader('set-cookie', clearCookieHeader({ secure: secureCookies }));
           return redirect(res, '/');
         }
 
@@ -512,7 +529,7 @@ You are signed in with this one.</p>`,
           const f = parseForm(await readBody(req));
           const offered = (f.invite || '').trim();
           if (!offered) return redirect(res, '/?error=' + encodeURIComponent('Enter an invite code.'));
-          if (inviteCode && offered !== inviteCode) {
+          if (!inviteCode || offered !== inviteCode) {
             return redirect(res, '/?error=' + encodeURIComponent('That invite code is not valid.'));
           }
           // One redemption per account, decided by the ledger rather than a flag that
@@ -551,8 +568,8 @@ sudo --preserve-env=OCM_HOST_TOKEN${agentId ? ` OCM_AGENT_ID="${agentId}"` : ''}
 ${agentId ? `<p class="muted"><code>OCM_AGENT_ID</code> is the name this token binds to. A reinstall keeps
 the name already on the machine, so it is only needed the first time.</p>` : ''}
 <p class="muted">See <a href="/provider">Run a provider</a> for the full guide.</p>`
-              : `<pre>export OPENAI_BASE_URL="https://${apiHost}/v1"
-export OPENAI_API_KEY="${cred.secret}"</pre>`,
+              : `<pre>export OPENAI_BASE_URL="https://${escHtml(apiHost)}/v1"
+export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
           }));
         }
 
@@ -585,13 +602,13 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           if (!creds.some((c) => c.id === f.credential_id)) return redirect(res, '/');
           await accounts.revoke(f.credential_id);
           if (claim && f.credential_id === claim.credentialId) {
-            res.setHeader('set-cookie', clearCookieHeader());
+            res.setHeader('set-cookie', clearCookieHeader({ secure: secureCookies }));
           }
           return redirect(res, '/?notice=' + encodeURIComponent('Credential revoked.'));
         }
       }
       if (url.pathname.startsWith('/admin/')) {
-        if (!adminToken || !bearer(req) || bearer(req) !== adminToken) {
+        if (!adminOk(bearer(req))) {
           return apiError(res, 401, 'admin token required', 'authentication_error');
         }
         if (req.method === 'POST' && url.pathname === '/admin/accounts') {
@@ -758,7 +775,13 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
       }
       return apiError(res, 404, `no route for ${req.method} ${url.pathname}`);
     } catch (err) {
-      return apiError(res, 500, err.message, 'internal_error');
+      // A malformed JSON body is the caller's error. Anything else is logged with the
+      // path and answered generically: driver messages and file paths belong in the
+      // journal, not in a response body (review P2-2).
+      if (err instanceof SyntaxError) return apiError(res, 400, 'body must be JSON');
+      console.error(JSON.stringify({ level: 'error', msg: 'unhandled request error',
+        method: req.method, path: String(req.url).split('?')[0], error: err.message }));
+      return apiError(res, 500, 'internal error', 'internal_error');
     }
   });
 
