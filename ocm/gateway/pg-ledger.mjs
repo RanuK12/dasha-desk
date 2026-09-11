@@ -11,7 +11,7 @@
 import pg from 'pg';
 import { readFileSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { startOfUtcDay } from './ledger.mjs';
+import { startOfUtcDay, utcDayKeys } from './ledger.mjs';
 
 const MAX_JOB_ID_LENGTH = 200;
 const ACCOUNTING_UNHEALTHY = 'ACCOUNTING_UNHEALTHY';
@@ -288,6 +288,48 @@ export class PgLedger {
       prompt_tokens: Number(r.prompt_tokens),
       completion_tokens: Number(r.completion_tokens),
     };
+  }
+
+  /** Same shape and semantics as Ledger#earnings; the arithmetic is done by Postgres. */
+  async earnings(hosts, { now = new Date(), days = 7 } = {}) {
+    const today = startOfUtcDay(now);
+    const weekStart = new Date(today.getTime() - (days - 1) * 86_400_000);
+    const daily = new Map(utcDayKeys(weekStart, days).map((day) => [day, { day, credited: 0, requests: 0 }]));
+    const list = [...new Set(hosts)];
+    const byHost = {};
+    if (list.length) {
+      const [perHost, perDay] = await Promise.all([
+        this.#query(
+          `SELECT host,
+                  COALESCE(SUM(completion_tokens) FILTER (WHERE at >= $2), 0)::bigint AS today,
+                  COALESCE(SUM(completion_tokens) FILTER (WHERE at >= $3), 0)::bigint AS week,
+                  COALESCE(SUM(completion_tokens), 0)::bigint AS all_time,
+                  COUNT(*)::bigint AS requests,
+                  MAX(at) AS last_at
+             FROM usage_log
+            WHERE kind = 'usage' AND host = ANY($1::text[])
+            GROUP BY host`,
+          [list, today.toISOString(), weekStart.toISOString()]),
+        this.#query(
+          `SELECT to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+                  COALESCE(SUM(completion_tokens), 0)::bigint AS credited,
+                  COUNT(*)::bigint AS requests
+             FROM usage_log
+            WHERE kind = 'usage' AND host = ANY($1::text[]) AND at >= $2
+            GROUP BY 1`,
+          [list, weekStart.toISOString()]),
+      ]);
+      for (const r of perHost.rows) {
+        byHost[r.host] = { today: Number(r.today), week: Number(r.week), all: Number(r.all_time),
+                           requests: Number(r.requests), last_at: new Date(r.last_at).toISOString() };
+      }
+      for (const r of perDay.rows) {
+        const d = daily.get(r.day);
+        if (d) { d.credited = Number(r.credited); d.requests = Number(r.requests); }
+      }
+    }
+    return { since_today: today.toISOString(), since_week: weekStart.toISOString(),
+             hosts: byHost, daily: [...daily.values()] };
   }
 
   async close() { await this.pool.end(); }

@@ -214,10 +214,49 @@ export class Ledger {
     };
   }
 
+  /**
+   * Provider earnings (ROADMAP P5): what each of an owner's machines has been credited
+   * today, over the last `days` UTC days and all time, plus a zero-filled per-day series
+   * for the dashboard. Credit is completion tokens as metered at the gateway, never the
+   * host's own count. `hosts` scopes the answer to the caller's machines, so nothing
+   * about another account's providers leaves this method.
+   */
+  async earnings(hosts, { now = new Date(), days = 7 } = {}) {
+    this.#requireHealthy();
+    const want = new Set(hosts);
+    const today = startOfUtcDay(now);
+    const weekStart = new Date(today.getTime() - (days - 1) * DAY_MS);
+    const daily = new Map(utcDayKeys(weekStart, days).map((day) => [day, { day, credited: 0, requests: 0 }]));
+    const byHost = {};
+    for (const e of this.entries) {
+      if (e.kind !== 'usage' || !want.has(e.host)) continue;
+      const h = byHost[e.host] ||= { today: 0, week: 0, all: 0, requests: 0, last_at: null };
+      const at = new Date(e.at);
+      h.all += e.completionTokens;
+      h.requests += 1;
+      if (!h.last_at || e.at > h.last_at) h.last_at = e.at;
+      if (at >= weekStart) {
+        h.week += e.completionTokens;
+        const d = daily.get(e.at.slice(0, 10));
+        if (d) { d.credited += e.completionTokens; d.requests += 1; }
+      }
+      if (at >= today) h.today += e.completionTokens;
+    }
+    return { since_today: today.toISOString(), since_week: weekStart.toISOString(),
+             hosts: byHost, daily: [...daily.values()] };
+  }
+
   async close() {}
 }
+
+const DAY_MS = 86_400_000;
 
 /** Midnight UTC, so "today" means the same thing on every ledger backend. */
 export function startOfUtcDay(now = new Date()) {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
+/** `n` consecutive UTC day keys (YYYY-MM-DD) starting at `start`, oldest first. */
+export function utcDayKeys(start, n) {
+  return Array.from({ length: n }, (_, i) => new Date(start.getTime() + i * DAY_MS).toISOString().slice(0, 10));
 }
