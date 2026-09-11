@@ -97,6 +97,23 @@ def verify_token(timeout=15):
         return False, f"could not reach {_http_base()}: {exc}"
 
 
+def _job_max_tokens(job):
+    """The gateway's per-request completion budget, never above the operator's
+    OCM_MAX_TOKENS if that is set. Older gateways send no budget; then the env or the
+    runtime default applies, as before."""
+    def as_int(value):
+        try:
+            n = int(value)
+            return n if n > 0 else None
+        except (TypeError, ValueError):
+            return None
+    want = as_int(job.get("max_tokens"))
+    cap = as_int(os.getenv("OCM_MAX_TOKENS"))
+    if want and cap:
+        return min(want, cap)
+    return want or cap
+
+
 def capabilities(models):
     """The record advertised at handshake (PDF §03 step 4)."""
     mem = 0
@@ -303,7 +320,7 @@ async def run_job(ws, job, jobs):
     def produce():
         try:
             for delta in RUNTIME.stream(job["model"], job["messages"], cancelled,
-                                        max_tokens=os.getenv("OCM_MAX_TOKENS")):
+                                        max_tokens=_job_max_tokens(job)):
                 loop.call_soon_threadsafe(queue.put_nowait, ("chunk", delta))
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
         except Exception as exc:                                  # noqa: BLE001
