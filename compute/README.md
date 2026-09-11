@@ -93,6 +93,18 @@ The doctor exits nonzero when the coordinator, Ollama, or any configured model i
 
 Measure actual model throughput with `python3 provider/agent.py --benchmark`. Set `DASHA_BENCHMARK_TOKENS` between 16 and 256 to trade speed for a longer calibrated run.
 
+### OpenRouter lane (external integrations)
+
+The coordinator exposes a dedicated lane for the OpenRouter provider listing so external traffic never shares the local consumer's key or queue semantics:
+
+- `GET /v1/models` serves the OpenRouter provider document: namespaced `dasha/<model>` ids, `openrouter.slug`, text input/output modality entries with `max_context_length` and declared `temperature`/`max_tokens`/`stream` parameters, `streaming: true`, and `is_free: true` (pricing omitted on the free launch). No datacenters or zero-data-retention claims are made.
+- `DASHA_OPENROUTER_KEY` is a separate credential. Unset disables the lane; it must never reuse a consumer or provider key.
+- OpenRouter calls authenticate to that key and get a dedicated token bucket (`OPENROUTER_RATE_LIMIT_RPM`, `OPENROUTER_RATE_LIMIT_BURST`) and a short queue window (`OPENROUTER_QUEUE_TIMEOUT_MS`). Under load or when no provider is online the lane fails with `429` + `Retry-After` — OpenRouter excludes 429 from uptime scoring, while 5xx would count against it. Local consumers keep the existing 503 behavior.
+- `POST /v1/chat/completions` accepts `dasha/<model>` ids (bare ids still work) and echoes the requested id back; streams emit `: keep-alive` comments (every `OPENROUTER_KEEPALIVE_MS`, default 10s) so long provider work is not cancelled as stalled. Streamed usage is always returned in the final chunk: provider-reported tokens when available, otherwise a chars/4 estimate — complete responses flag estimates with `X-Dasha-Usage-Estimated: true`, never silent zeros.
+- `OPENROUTER_IS_FREE=false` flips the document to `is_free: false`, which OpenRouter uses to stage the paid conversion.
+
+This lane is a reference implementation for the live `lobby.getdasha.com` gateway: it is not deployed and does not go live by merging.
+
 ## Verify or build the source archive
 
 The repository builds the download from an explicit source allowlist. Every archive

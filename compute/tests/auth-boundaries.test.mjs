@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import net from "node:net";
 import test from "node:test";
 
 /* The coordinator's auth and request-validation boundaries are its security
@@ -11,15 +10,31 @@ import test from "node:test";
 const CONSUMER_KEY = "consumer-test";
 const PROVIDER_KEY = "provider-test";
 
-async function freePort() {
-  return await new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address();
-      server.close(() => resolve(port));
-    });
+/* Spawn the coordinator on a race-free OS-assigned port: PORT=0 binds
+   atomically and the helper reads the listening line from stdout. The old
+   freePort-then-spawn pattern let two parallel test coordinators collide on
+   one port and steal each other's jobs. */
+async function spawnCoordinator(context, extraEnv = {}) {
+  const child = spawn(process.execPath, ["coordinator/server.mjs"], {
+    cwd: new URL("..", import.meta.url),
+    env: { ...process.env, PORT: "0", JOB_TIMEOUT_MS: "5000", ...extraEnv },
+    stdio: ["ignore", "pipe", "ignore"],
   });
+  context.after(() => child.kill("SIGTERM"));
+  const port = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("coordinator did not print a listening port")), 10_000);
+    let text = "";
+    child.stdout.on("data", (chunk) => {
+      text += chunk.toString();
+      const match = text.match(/listening on http:\/\/[^/:]+:(\d+)/);
+      if (match) { clearTimeout(timer); resolve(Number(match[1])); }
+    });
+    child.once("error", (error) => { clearTimeout(timer); reject(error); });
+    child.once("exit", (code) => { clearTimeout(timer); reject(new Error(`coordinator exited before listening (code ${code})`)); });
+  });
+  const base = `http://127.0.0.1:${port}`;
+  await waitFor(`${base}/healthz`);
+  return base;
 }
 
 async function waitFor(url) {
@@ -31,16 +46,7 @@ async function waitFor(url) {
 }
 
 async function coordinator(context) {
-  const port = await freePort();
-  const base = `http://127.0.0.1:${port}`;
-  const child = spawn(process.execPath, ["coordinator/server.mjs"], {
-    cwd: new URL("..", import.meta.url),
-    env: { ...process.env, PORT: String(port), DASHA_API_KEY: CONSUMER_KEY, DASHA_PROVIDER_KEY: PROVIDER_KEY, JOB_TIMEOUT_MS: "5000" },
-    stdio: "ignore",
-  });
-  context.after(() => child.kill("SIGTERM"));
-  await waitFor(`${base}/healthz`);
-  return base;
+  return spawnCoordinator(context, { DASHA_API_KEY: CONSUMER_KEY, DASHA_PROVIDER_KEY: PROVIDER_KEY });
 }
 
 function chat(base, body, key = CONSUMER_KEY) {
@@ -50,14 +56,19 @@ function chat(base, body, key = CONSUMER_KEY) {
 }
 
 async function pollOnce(base, providerId, models = ["qwen3-8b"]) {
-  const response = await fetch(`${base}/v1/providers/poll`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${PROVIDER_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ provider_id: providerId, name: "Test Mac", models }),
-  });
-  if (response.status === 204) return null;
-  assert.equal(response.status, 200);
-  return (await response.json()).job;
+  // Retry on 204 like the repo's pollForJob: the chat POST and the poll race
+  // over loopback, and under parallel-suite load the poll can arrive first.
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const response = await fetch(`${base}/v1/providers/poll`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${PROVIDER_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ provider_id: providerId, name: "Test Mac", models }),
+    });
+    if (response.status === 204) { await new Promise((resolve) => setTimeout(resolve, 25)); continue; }
+    assert.equal(response.status, 200);
+    return (await response.json()).job;
+  }
+  throw new Error("provider did not receive a job");
 }
 
 async function network(base) {

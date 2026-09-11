@@ -28,17 +28,35 @@ async function waitFor(url) {
   throw new Error("coordinator did not start");
 }
 
-async function coordinator(context) {
-  const port = await freePort();
-  const base = `http://127.0.0.1:${port}`;
+/* Spawn the coordinator on a race-free OS-assigned port: PORT=0 binds
+   atomically and the helper reads the listening line from stdout. The old
+   freePort-then-spawn pattern let two parallel test coordinators collide on
+   one port and steal each other's jobs. */
+async function spawnCoordinator(context, extraEnv = {}) {
   const child = spawn(process.execPath, ["coordinator/server.mjs"], {
     cwd: new URL("..", import.meta.url),
-    env: { ...process.env, PORT: String(port), DASHA_API_KEY: "consumer-test", DASHA_PROVIDER_KEY: "provider-test", JOB_TIMEOUT_MS: "5000" },
-    stdio: "ignore",
+    env: { ...process.env, PORT: "0", JOB_TIMEOUT_MS: "5000", ...extraEnv },
+    stdio: ["ignore", "pipe", "ignore"],
   });
   context.after(() => child.kill("SIGTERM"));
+  const port = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("coordinator did not print a listening port")), 10_000);
+    let text = "";
+    child.stdout.on("data", (chunk) => {
+      text += chunk.toString();
+      const match = text.match(/listening on http:\/\/[^/:]+:(\d+)/);
+      if (match) { clearTimeout(timer); resolve(Number(match[1])); }
+    });
+    child.once("error", (error) => { clearTimeout(timer); reject(error); });
+    child.once("exit", (code) => { clearTimeout(timer); reject(new Error(`coordinator exited before listening (code ${code})`)); });
+  });
+  const base = `http://127.0.0.1:${port}`;
   await waitFor(`${base}/healthz`);
   return base;
+}
+
+async function coordinator(context) {
+  return spawnCoordinator(context, { DASHA_API_KEY: "consumer-test", DASHA_PROVIDER_KEY: "provider-test" });
 }
 
 async function pollForJob(base, providerId) {
