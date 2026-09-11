@@ -53,8 +53,9 @@ export const cookieHeader = (token, { secure = true } = {}) =>
   `ocm_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${MAX_AGE_S}` +
   (secure ? '; Secure' : '');
 
-export const clearCookieHeader = () =>
-  'ocm_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0';
+// Same attributes as the set, so the browser matches and removes the right cookie.
+export const clearCookieHeader = ({ secure = true } = {}) =>
+  'ocm_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' + (secure ? '; Secure' : '');
 
 export function readCookie(header, name = 'ocm_session') {
   for (const part of (header || '').split(';')) {

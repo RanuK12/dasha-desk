@@ -725,6 +725,9 @@ install defaults to the hostname plus a hardware-derived suffix, so identically 
 Macs cannot collide. Set it only to choose a name.
 Inference runs as the invoking user, not root.
 Confirm with: /opt/ocm/bin/ocm-agent-run --doctor   (expect: token ok)
+Health from a script: GET https://${esc(apiHost)}/healthz (JSON); public status is
+  GET https://${esc(apiHost)}/v1/network (JSON) or the console's /status page.
+  Do not probe /provider/status or /provider/healthz: they do not exist and answer 404.
 The first request takes up to ~90s while the model loads. That is not a fault.
 Rotate later with: sudo /opt/ocm/bin/ocm-agent-token   (it prompts; or pipe on stdin)
 Update later with: sudo /opt/ocm/bin/ocm-agent-update  (--check to only look; no token needed)
@@ -744,6 +747,9 @@ machine in plaintext, and so can every other provider.</pre>
 <tr><td><code>a developer key…</code></td><td>An <code>ocm_live_</code> key is in <code>OCM_HOST_TOKEN</code>.</td></tr>
 <tr><td><code>disconnected… retrying</code></td><td>Ordinary churn. It reconnects itself.</td></tr>
 <tr><td>Connected, not listed</td><td>No models reported. <code>--doctor</code> names the problem.</td></tr>
+<tr><td>Checking from a script</td><td>Liveness is <code>GET /healthz</code> on the API host. Public status is
+<code>/status</code> here, or <code>/v1/network</code> as JSON on the API host. There is no <code>/provider/status</code>
+or <code>/provider/healthz</code>; those answer 404.</td></tr>
 </tbody></table></div>
 </div></details>
 
