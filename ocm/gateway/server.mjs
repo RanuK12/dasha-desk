@@ -20,6 +20,7 @@ import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGui
 import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
+import { normalizeChatRequest } from './request.mjs';
 import { AGENT_DIR, installSha256, agentSha256, shortBuild, buildState } from './agentfiles.mjs';
 
 // For the few places a secret or host name is interpolated into console HTML outside
@@ -812,9 +813,18 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
     try { body = JSON.parse(await readBody(req)); }
     catch { return apiError(res, 400, 'body must be JSON'); }
 
-    const { model, messages, stream = false } = body || {};
-    if (!model) return apiError(res, 400, 'model is required');
-    if (!Array.isArray(messages) || !messages.length) return apiError(res, 400, 'messages must be a non-empty array');
+    // Bounded request (review P1-2): tools, structured output and non-text content
+    // are refused with the reason; sampling parameters the runtimes do not apply are
+    // accepted and named in a header; the completion budget is clamped and named.
+    let request;
+    try { request = normalizeChatRequest(body); }
+    catch (err) {
+      if (err instanceof TypeError) return apiError(res, 400, err.message, 'invalid_request_error');
+      throw err;
+    }
+    const { model, messages, stream, maxTokens, ignored, adjusted } = request;
+    if (ignored.length) res.setHeader('x-ocm-ignored-params', ignored.join(','));
+    if (adjusted) res.setHeader('x-ocm-adjusted', Object.entries(adjusted).map(([k, v]) => `${k}=${v}`).join(','));
 
     // Resolve what will actually serve this request. Asking for something we have is
     // unchanged; asking for something we do not falls back, and is disclosed below.
@@ -846,7 +856,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
       // The response carries the model that served, never an echo of the request.
       // Silent substitution is the fastest way to become untrustworthy.
       if (substituted && !res.headersSent) res.setHeader('x-ocm-served-model', served);
-      const outcome = await runJob({ host, jobId, model: served, messages, stream, res, chatId, created, consumer, promptTokens });
+      const outcome = await runJob({ host, jobId, model: served, messages, maxTokens, stream, res, chatId, created, consumer, promptTokens });
       if (outcome.ok || outcome.committed || outcome.aborted || res.destroyed || res.writableEnded) return;
       // else: nothing was delivered to the client — safe to try another host
     }
@@ -863,7 +873,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
    * nothing is committed until the final JSON, so a host dying mid-generation is
    * transparently retried and never billed.
    */
-  function runJob({ host, jobId, model, messages, stream, res, chatId, created, consumer, promptTokens }) {
+  function runJob({ host, jobId, model, messages, maxTokens, stream, res, chatId, created, consumer, promptTokens }) {
     return new Promise((resolve) => {
       let committed = false;   // bytes written to the client
       let text = '';           // what we have delivered (streaming) or accumulated
@@ -1005,7 +1015,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
       res.on('close', onClientGone);
 
       const sent = host.conn.sendJson({
-        t: 'job', id: jobId, model: wireModel, messages });
+        t: 'job', id: jobId, model: wireModel, messages, max_tokens: maxTokens });
       if (sent === false && !committed && claimSettlement()) {
         finish({ ok: false, committed: false, message: 'host send failed' });
       }
