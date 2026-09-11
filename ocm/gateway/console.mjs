@@ -35,6 +35,41 @@ const ago = (d) => {
  * One table, four steps: code issued, enrolled, first connected, first job. Shared by
  * the owner's dashboard and the admin network view (which adds the owner column).
  */
+/**
+ * The owner's earnings: totals, per machine, and a seven-day strip. Credit is the
+ * completion tokens a machine produced as counted at the gateway. Credits are not money,
+ * and the section says so rather than letting a number imply otherwise.
+ */
+function earningsSection(earn, machineIds, live) {
+  const zero = { today: 0, week: 0, all: 0, requests: 0, last_at: null };
+  const rows = machineIds.map((id) => {
+    const e = earn.hosts[id] || zero;
+    const h = live.get(id);
+    return `<tr><td><span class="dot ${h && (h.inflight || h.warm) ? 'on' : 'off'}"></span><code>${esc(id)}</code></td>
+    <td>${num(e.today)}</td><td>${num(e.week)}</td><td>${num(e.all)}</td><td>${num(e.requests)}</td>
+    <td>${e.last_at ? esc(ago(e.last_at)) : '<span class="muted">never</span>'}</td></tr>`;
+  }).join('');
+  const sum = (k) => machineIds.reduce((n, id) => n + ((earn.hosts[id] || zero)[k]), 0);
+  const days = earn.daily;
+  return `
+<h2>Earnings</h2>
+<div class="grid">
+  <div class="card"><div class="k">Credited today</div><div class="v">${num(sum('today'))}</div></div>
+  <div class="card"><div class="k">Last 7 days</div><div class="v">${num(sum('week'))}</div></div>
+  <div class="card"><div class="k">All time</div><div class="v">${num(sum('all'))}</div></div>
+  <div class="card"><div class="k">Requests served</div><div class="v">${num(sum('requests'))}</div></div>
+</div>
+<div class="tablewrap"><table class="data">
+<thead><tr><th>Machine</th><th>Today</th><th>7 days</th><th>All time</th><th>Requests</th><th>Last served</th></tr></thead>
+<tbody>${rows}</tbody></table></div>
+<div class="tablewrap" style="margin-top:8px"><table class="data">
+<thead><tr><th>Day (UTC)</th>${days.map((d) => `<th>${esc(d.day.slice(5))}</th>`).join('')}</tr></thead>
+<tbody><tr><td>Credited</td>${days.map((d) => `<td>${num(d.credited)}</td>`).join('')}</tr>
+<tr><td>Requests</td>${days.map((d) => `<td>${num(d.requests)}</td>`).join('')}</tr></tbody></table></div>
+<p class="muted" style="margin-top:8px">Credits are the completion tokens your machines produced, counted at the gateway rather
+than by the machine. They are not money and have no payout today. Days are UTC.</p>`;
+}
+
 /** One cell: the build a host runs, and whether it is the one served. */
 function buildCell(h) {
   const b = h.build ? `<code>${esc(h.build)}</code>` : '<span class="muted">unreported</span>';
@@ -311,6 +346,11 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
   const led = await ledger.summary();
   const live = new Map(s.hosts.map((h) => [h.id, h]));
   const funnelHtml = funnelTable(funnel, { live, firstServed, credited: led.creditedByHost });
+  // Earnings (P5): every machine this account has enrolled or connected, whether or not
+  // it is online now. Scoped by machine id, so another account's providers never enter.
+  const machineIds = [...new Set([...funnel.map((r) => r.agent_id).filter(Boolean), ...myHosts.map((h) => h.id)])];
+  const earn = typeof ledger.earnings === 'function' && machineIds.length ? await ledger.earnings(machineIds) : null;
+  const earnHtml = earn ? earningsSection(earn, machineIds, live) : '';
 
   const credRows = creds.length ? creds.map((c) => `<tr>
     <td>${c.kind === 'developer_key' ? 'Developer key' : 'Provider token'}</td>
@@ -366,7 +406,7 @@ ${redeemBlock}
   : '<div class="empty">None yet. <a href="/provider">Run a provider</a> to contribute a Mac.</div>')}</div>
 ${funnelHtml ? `<p class="muted" style="margin-top:8px">Each machine's path: code issued, enrolled, first connected, first job served.
 A row that stops early is where that machine's setup stopped.</p>` : ''}
-
+${earnHtml}
 <h2>Credentials</h2>
 <div class="tablewrap">${credRows ? `<table class="data">
 <thead><tr><th>Kind</th><th>Label</th><th>Id</th><th>Machine</th><th>Created</th><th>Last used</th><th></th></tr></thead>
