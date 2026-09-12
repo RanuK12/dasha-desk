@@ -21,6 +21,8 @@ Also on www: [How to buy](https://www.getdasha.com/how-to-buy) ·
 
 [![CoinGecko](https://img.shields.io/badge/CoinGecko-dash__eats-8BC34A?logo=coingecko&logoColor=white)](https://www.coingecko.com/en/coins/dash_eats)
 
+[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/www-getdasha-com-compute-mcp-json)
+
 `$dasha` / dash_eats on Solana. Mint `53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump`. [CoinGecko](https://www.coingecko.com/en/coins/dash_eats) · [Dexscreener](https://dexscreener.com/solana/9KkDpvUQRqXjiuyMFcy1CwqrxLwDcGGUR2Cap2Qt7bU7) · [GeckoTerminal](https://www.geckoterminal.com/solana/pools/9KkDpvUQRqXjiuyMFcy1CwqrxLwDcGGUR2Cap2Qt7bU7) · [Buy on Jupiter](https://jup.ag/tokens/53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump)
 
 ## Worker-first getdasha.com
