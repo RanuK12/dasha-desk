@@ -16,7 +16,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
 import { createMailer, recoveryMessage, maskEmail } from './mail.mjs';
-import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderEnrollment, renderStatus } from './console.mjs';
+import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderDeveloperGuide, renderProfile, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderEnrollment, renderStatus } from './console.mjs';
 import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
@@ -384,6 +384,38 @@ export async function createGateway({
           return html(res, 200, renderProviderGuide({
             account, apiHost, models: registry.models(), admin: isAdmin(account),
             installHash: await installSha256(),
+          }));
+        }
+
+        if (req.method === 'GET' && consolePath === '/developer') {
+          // The developer counterpart to /provider: the onboarding destination for
+          // API consumers. Public for the same reason — no account data on it.
+          return html(res, 200, renderDeveloperGuide({
+            account, apiHost, models: registry.models(), admin: isAdmin(account),
+          }));
+        }
+
+        if (req.method === 'GET' && consolePath === '/profile') {
+          // The signed-in account's own page. A stranger gets the landing redirect,
+          // the same refusal shape as /network, rather than a hint the page exists.
+          if (!account) return redirect(res, '/');
+          const creds = await accounts.listCredentials(account.id);
+          const led = await ledger.summary();
+          const mine = led.consumers.find((c) => c.consumer === account.id)
+            || { balance: 0, used: 0, requests: 0 };
+          return html(res, 200, renderProfile({
+            account,
+            admin: isAdmin(account),
+            profile: {
+              emailVerifiedAt: account.email_verified_at || null,
+              createdAt: account.created_at || null,
+              balance: mine.balance,
+              used: mine.used,
+              requests: mine.requests,
+              devKeys: creds.filter((c) => c.kind === 'developer_key' && !c.revoked_at).length,
+              providerTokens: creds.filter((c) => c.kind === 'provider_token' && !c.revoked_at).length,
+              machinesOnline: registry.online().filter((h) => h.caps.accountId === account.id).length,
+            },
           }));
         }
 

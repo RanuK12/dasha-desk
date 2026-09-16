@@ -27,7 +27,9 @@
   "provider/save-provider-key.py",
   "release-files.json",
   "scripts/build-release.mjs",
+  "tests/auth-boundaries.test.mjs",
   "tests/e2e.test.mjs",
+  "tests/openrouter-provider.test.mjs",
   "tests/provider-key.test.mjs",
   "tests/release.test.mjs"
 ]
