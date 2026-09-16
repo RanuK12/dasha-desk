@@ -58,6 +58,8 @@ const ROUTES = [
     why: 'the recovery form. Its answer is identical for known and unknown addresses' },
   { method: 'GET', path: '/console/provider', auth: 'public', unauth: 200,
     why: 'the recruiting guide. Holds no account data; it is the link prospects get' },
+  { method: 'GET', path: '/console/developer', auth: 'public', unauth: 200,
+    why: 'the developer onboarding guide. Holds no account data; the API-consumer counterpart to /provider' },
   { method: 'GET', path: '/console/status', auth: 'public', unauth: 200,
     why: 'providers online and tokens served. No owners, ids or balances, by design' },
 
@@ -66,6 +68,8 @@ const ROUTES = [
     why: 'THE REGRESSION. Account ids, balances, and a per-job log of who ran what where' },
   { method: 'GET', path: '/console/network', auth: 'session+admin', unauth: 302,
     why: 'lists every account and its usage. Non-admins get the same redirect as strangers' },
+  { method: 'GET', path: '/console/profile', auth: 'session', unauth: 302,
+    why: 'the signed-in account only: identity, verification, usage. A stranger gets the landing redirect' },
   { method: 'POST', path: '/console/redeem', auth: 'session', unauth: 302,
     why: 'grants tokens against an account' },
   { method: 'POST', path: '/console/keys/new', auth: 'session', unauth: 302,

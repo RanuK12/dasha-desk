@@ -196,8 +196,8 @@ claimed that the architecture cannot enforce.</footer>` : ''}</div></body></html
  */
 const nav = (email, admin = false) => `<nav>
   <div class="links"><strong>OCM</strong>
-    <a href="/">Overview</a><a href="/provider">Run a provider</a><a href="/status">Status</a>${admin ? '<a href="/network">Network</a>' : ''}</div>
-  ${email ? `<div class="who"><span class="muted" title="${esc(email)}">${esc(email)}</span>
+    <a href="/">Overview</a><a href="/provider">Run a provider</a><a href="/developer">Developers</a><a href="/status">Status</a>${admin ? '<a href="/network">Network</a>' : ''}</div>
+  ${email ? `<div class="who"><a href="/profile">Profile</a><span class="muted" title="${esc(email)}">${esc(email)}</span>
     <form method="post" action="/signout"><button class="ghost" style="margin:0;padding:6px 12px">Sign out</button></form></div>`
     : `<div class="who"><a class="muted" href="/">Sign in or create an account</a></div>`}</nav>`;
 
@@ -403,7 +403,9 @@ export OPENAI_API_KEY="ocm_live_…"</pre>
 If your tool asks for a model we do not serve, such as <code>gpt-4o</code>, the request is
 served by the network default rather than refused. The response tells you what actually
 ran, in the <code>model</code> field and an <code>x-ocm-served-model</code> header, so a
-substitution is never silent.</p>`);
+substitution is never silent.</p>
+<p class="muted">New here? The <a href="/developer">developer guide</a> walks from account
+creation to a first request.</p>`);
 }
 
 /**
@@ -709,4 +711,127 @@ so treat it as a background tenant on a machine you are still using.</p>
 
 ${account ? '' : `<div class="note"><a href="/">Create an account</a> to issue a provider
 token. No invite code is needed to run a provider.</div>`}`);
+}
+
+/**
+ * The developer counterpart to the provider guide: everything a consumer needs to
+ * go from zero to a first request. Public like /provider — it is the link the
+ * "Run work on a Mac" button sends prospects to, and it holds no account data.
+ */
+export function renderDeveloperGuide({ account = null, apiHost, models, admin = false }) {
+  const email = account ? account.email : '';
+  return page('Developers', `${nav(email, admin)}
+<h1>Developers</h1>
+<p class="sub">One OpenAI-compatible API over idle Apple Silicon Macs. No SDK to install —
+anything that speaks the OpenAI API works unmodified.</p>
+
+<h2>Worth knowing first</h2>
+<ul class="facts">
+<li><b>Credits are not money.</b> They count tokens; there is no billing and no payout today.</li>
+<li><b>Providers see your prompts in plaintext.</b> Anything routed to a Mac is visible to
+whoever runs it, and the same is true of every other provider. Do not send secrets.</li>
+<li><b>A cold provider takes about 90 seconds</b> on the first request while it loads the
+model. Everything after that takes about a second; the <a href="/status">status page</a>
+shows which machines are warm.</li>
+<li><b>Unknown models are served, not refused.</b> If your tool asks for a model we do not
+serve, such as <code>gpt-4o</code>, the request runs on the network default. The response
+always says what actually ran, in the <code>model</code> field and an
+<code>x-ocm-served-model</code> header, so a substitution is never silent.</li>
+</ul>
+
+<h2>Get a key</h2>
+
+<div class="step">
+  <h3><span class="num">1</span>Create an account</h3>
+  <p class="cap">${account ? `You are signed in as ${esc(email)} — this step is done.`
+    : `On the <a href="/">console</a>, with just an email address. The account is free;
+    what costs tokens is calling the API.`}</p>
+</div>
+
+<div class="step">
+  <h3><span class="num">2</span>Get tokens</h3>
+  <p class="cap">New accounts start at zero and API requests are refused until tokens are
+  granted. Redeem an invite code from the console dashboard — one redemption per account.
+  Running a provider needs no invite code at all: a Mac earns credits as it serves.</p>
+</div>
+
+<div class="step">
+  <h3><span class="num">3</span>Issue a developer key</h3>
+  <p class="cap">${account ? `On the <a href="/">console</a>, under <strong>New developer key</strong>.`
+    : `On the <a href="/">console</a>, under <strong>New developer key</strong>.`}
+  The key starts <code>ocm_live_</code> and is shown once. A provider token
+  (<code>ocm_host_</code>) or an enrollment code (<code>ocm_enroll_</code>) will not work here.</p>
+</div>
+
+<h2>First request</h2>
+
+<div class="step">
+  <h3><span class="num">4</span>Point your client at the gateway</h3>
+  <code class="cmd">export OPENAI_BASE_URL="https://${esc(apiHost)}/v1"
+export OPENAI_API_KEY="ocm_live_…"</code>
+</div>
+
+<div class="step">
+  <h3><span class="num">5</span>Send one</h3>
+  <code class="cmd">curl "$OPENAI_BASE_URL/chat/completions" \\
+  -H "Authorization: Bearer $OPENAI_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "${esc(models[0] || 'ocm-coder')}", "messages": [{"role": "user", "content": "Say hi in five words."}]}'</code>
+  <p class="cap">Or in Python, with the <code>openai</code> package and no other changes:</p>
+  <code class="cmd">from openai import OpenAI
+client = OpenAI()  # reads OPENAI_BASE_URL and OPENAI_API_KEY
+resp = client.chat.completions.create(
+    model="${esc(models[0] || 'ocm-coder')}",
+    messages=[{"role": "user", "content": "Say hi in five words."}])
+print(resp.choices[0].message.content, "| served by", resp.model)</code>
+</div>
+
+<div class="step">
+  <h3><span class="num">6</span>See what ran</h3>
+  <p class="cap">The response's <code>model</code> field names the model that actually
+  served the request, and the <code>x-ocm-served-model</code> header repeats it. Token
+  usage comes back on every response; the gateway counts it, never the provider's word
+  for it. Your balance, usage and keys live on the <a href="/">console</a>.</p>
+</div>
+
+<h2>Models</h2>
+<p>${models.length ? models.map((m) => `<code>${esc(m)}</code>`).join(' ') : '<span class="muted">No models are currently served.</span>'}</p>
+
+${account ? '' : `<div class="note"><a href="/">Create an account</a> to get a developer key.
+Have an idle Mac instead? <a href="/provider">Run a provider</a> — no invite code needed.</div>`}`);
+}
+
+/**
+ * The signed-in account's own page: identity, verification state, and a summary of
+ * what the account holds. It renders only the signed-in account's data — never
+ * anyone else's — and links back to the console for acting on credentials.
+ */
+export function renderProfile({ account, profile, admin = false }) {
+  const day = (d) => d ? new Date(d).toISOString().slice(0, 10) : '—';
+  return page('Profile', `${nav(account.email, admin)}
+<h1>Profile</h1>
+<p class="sub">Your account on this network.</p>
+
+<div class="card" style="margin-bottom:8px">
+  <h3>Identity</h3>
+  <p><strong>Email</strong><br>${esc(account.email)}</p>
+  <p class="muted">${profile.emailVerifiedAt
+    ? `Verified ${esc(day(profile.emailVerifiedAt))} — this address proved it can receive mail.`
+    : 'Not verified. Verification happens the first time you recover the account by email.'}</p>
+  <p class="muted">Member since ${esc(day(profile.createdAt))}</p>
+</div>
+
+<h2>Usage</h2>
+<div class="grid">
+  <div class="card"><div class="k">Balance</div><div class="v">${num(profile.balance)}</div></div>
+  <div class="card"><div class="k">Tokens used</div><div class="v">${num(profile.used)}</div></div>
+  <div class="card"><div class="k">Requests</div><div class="v">${num(profile.requests)}</div></div>
+  <div class="card"><div class="k">Developer keys</div><div class="v">${num(profile.devKeys)}</div></div>
+  <div class="card"><div class="k">Provider tokens</div><div class="v">${num(profile.providerTokens)}</div></div>
+  <div class="card"><div class="k">Machines online</div><div class="v">${num(profile.machinesOnline)}</div></div>
+</div>
+
+<p class="muted" style="margin-top:12px">Keys, machines and enrollment live on the
+<a href="/">console</a>, where they can be issued, released and revoked.</p>
+<form method="post" action="/signout"><button class="ghost">Sign out</button></form>`);
 }

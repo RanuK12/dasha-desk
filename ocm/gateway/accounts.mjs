@@ -287,7 +287,7 @@ export class PgAccounts {
   }
 
   async accountFor(accountId) {
-    const { rows } = await this.pool.query(`SELECT id, email, email_verified_at FROM accounts WHERE id = $1`, [accountId]);
+    const { rows } = await this.pool.query(`SELECT id, email, created_at, email_verified_at FROM accounts WHERE id = $1`, [accountId]);
     return rows[0] || null;
   }
 
