@@ -27,7 +27,7 @@ Before external provider traffic or money:
 
 - provider credentials must never appear in WebSocket URLs or proxy logs;
 - usage clearing must remain at-most-once under duplicate, racing, and ambiguous terminal events;
-- accounting must fail closed or recover durably after a committed-response write failure;
+- accounting fails closed after a committed-response write failure (a 503, or an SSE `error` event with no `[DONE]`, and `/healthz` names the job until a restart) and concurrent requests cannot overdraw one balance; durable recovery without a restart is still open;
 - approximate character-based metering must be replaced before billing by model-specific tokens;
 - provider/runtime/model identities need immutable provenance;
 - residential connection stability, update recovery, and multi-host reliability need a real pilot;
