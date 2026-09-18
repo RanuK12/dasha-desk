@@ -1,0 +1,14 @@
+{
+  "schema": "commons.external-receipt/v1",
+  "provider": "gitwork",
+  "purpose": "contributor_bounty",
+  "githubIssue": "https://github.com/Uuriko/dasha-desk/issues/164",
+  "externalId": "gitwork-5351093923",
+  "providerStatus": "funded",
+  "chain": "solana",
+  "asset": "USDC",
+  "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "amount": "25",
+  "fundingSignature": "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqAbRqkmfdWNLYi19x9oK3m4H5E6F7G8J9KLMNPQRSTUVWX",
+  "observedAt": "2026-09-05T05:00:00.000Z"
+}
