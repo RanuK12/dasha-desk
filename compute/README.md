@@ -89,7 +89,7 @@ Before joining a test, check the complete local chain:
 python3 provider/agent.py --doctor
 ```
 
-The doctor exits nonzero when the coordinator, Ollama, or any configured model is unavailable.
+The doctor exits nonzero when the coordinator, Ollama, or any configured model is unavailable. It also fails when Ollama is below the version floor (≥0.33.1, pinned in `compute/README.md`), when the Ollama port answers as a non-Ollama service, when free disk cannot cover the missing model pulls (1.5× headroom), or when the coordinator rejects the provider token (with a re-register hint — the token itself is never printed). It warns, without failing, when a mapped model needs more unified memory than the Mac has or when the Ollama version is unreadable. `python3 provider/agent.py --doctor --json` emits the machine-readable check list for the installer and funnel analytics.
 
 Measure actual model throughput with `python3 provider/agent.py --benchmark`. Set `DASHA_BENCHMARK_TOKENS` between 16 and 256 to trade speed for a longer calibrated run.
 

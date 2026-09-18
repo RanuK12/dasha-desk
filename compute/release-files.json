@@ -28,6 +28,7 @@
   "release-files.json",
   "scripts/build-release.mjs",
   "tests/auth-boundaries.test.mjs",
+  "tests/doctor-checks.test.mjs",
   "tests/e2e.test.mjs",
   "tests/openrouter-provider.test.mjs",
   "tests/provider-key.test.mjs",
