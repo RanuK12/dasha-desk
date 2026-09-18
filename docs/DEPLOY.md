@@ -8,6 +8,8 @@ Do not invent a Worker here. Do not `wrangler deploy` from here. Do not Designer
 
 Live buy path: [getdasha.com/how-to-buy](https://www.getdasha.com/how-to-buy).
 `/dasha` and `/desk` 308 there. `/studio` is retired (308 home). `/privacy` is a real 200 page.
+`/compute` is a live, first-class product page (Dasha Compute), linked from Home and listed
+in the sitemap.
 
 The route map Watch asserts is [`ROUTES.md`](ROUTES.md).
 
@@ -56,13 +58,30 @@ HTML. Verify reads this repo. A green Verify and a red Watch means the Worker dr
 
 Do not weaken `watch.mjs` to hide a live bug. Change an expectation only when the
 production contract itself changed (Studio retired, privacy is 200, desk/dasha → how-to-buy,
-compute retired).
+Compute promoted to a first-class product page).
 
 Mint stays `53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump`. Jupiter is `jup.ag` + mint.
 Never `plugin.jup.ag`. Chess stays off Home.
 
-`/privacy` must 200 with H1 Privacy. `/compute` is 410 or branded 404, noindex, and stays
-out of the sitemap.
+`/privacy` must 200 with H1 Privacy.
+
+`/compute` is **not** retired. Watch asserts it as a first-class product page, matching
+[`ROUTES.md`](ROUTES.md):
+
+- `/compute` returns 200 with an H1, a `<title>` that names Compute, a canonical of
+  `https://www.getdasha.com/compute`, and a clear open-model explanation (Watch matches
+  `OpenAI-compatible`, `Ollama`, or `idle Macs`).
+- Home (`/`) must ship a real, visible `<a href="/compute">` link. A bare `/compute` string
+  is not enough, and a stylesheet rule that hides the link with `display: none` fails.
+- `/sitemap.xml` must list `/compute` alongside `/privacy` `/lobby` `/chess` `/faucet`
+  `/bag` `/how-to-buy` `/simp`.
+- The Compute open-alpha release must be served from the edge:
+  `/dasha-compute-open-alpha.tar.gz`, its `.sha256` (matching the archive digest), and
+  `/compute/release.json` (`watch-compute-release.mjs`).
+
+Older notes that said `/compute` should 410, serve a branded 404, carry `noindex`, or stay
+out of the sitemap are out of date. If the live site does any of that, Watch is red and the
+Worker is wrong, not the test.
 
 Live `https://www.getdasha.com/sitemap.xml` is Worker-owned (`x-dasha-edge: sitemap`).
 Adding a sitemap file here would not update www.
