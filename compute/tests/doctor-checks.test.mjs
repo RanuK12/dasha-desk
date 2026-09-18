@@ -66,6 +66,9 @@ function doctorEnv(port, extra = {}) {
     OLLAMA_URL: `http://127.0.0.1:${port}`,
     DASHA_MODEL_MAP: "qwen3-8b=qwen3:8b",
     DASHA_DOCTOR_TEST_MEMORY_GB: "64",
+    // the OS gate (G1) would fail on Linux CI; these tests target the other
+    // checks, and G1/G3 have their own platform-hook cases below
+    DASHA_DOCTOR_TEST_PLATFORM: "Darwin:arm64:15.0",
     ...extra,
   };
 }
@@ -164,7 +167,7 @@ test("doctor --json emits the machine-readable check contract", async (context) 
   const payload = JSON.parse(stdout);
   assert.equal(payload.exit_code, 0);
   assert.deepEqual(payload.checks.map((check) => check.name),
-    ["gateway", "ollama", "ollama-version", "models", "disk", "memory-fit", "key"]);
+    ["os", "python", "gateway", "network", "ollama", "ollama-version", "models", "disk", "memory-fit", "mlx", "key", "service", "keychain", "benchmark"]);
   for (const check of payload.checks) {
     assert.match(check.status, /^(pass|fail|warn|skip)$/);
     assert.equal(typeof check.detail, "string");

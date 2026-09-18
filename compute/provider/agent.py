@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -45,6 +46,20 @@ MODELS = model_map()
 # Ollama version floor, pinned in one place. Must match the "Ollama ≥0.33.1"
 # requirement in compute/README.md (the live Provide page's floor).
 OLLAMA_MIN_VERSION = (0, 33, 1)
+
+# Python floor for the provider agent (G14), pinned in one place.
+PYTHON_MIN_VERSION = (3, 10)
+
+# LaunchAgent label — also the Keychain generic-password service label (-s),
+# both written by install.sh. Keep in sync with LABEL in compute/install.sh.
+PROVIDER_LABEL = "com.getdasha.compute.provider"
+
+# Coordinator round-trip budget for the poll path (G13). Advisory only —
+# doctor warns above this, never fails.
+GATEWAY_RTT_WARN_S = 2.0
+
+# Benchmark staleness threshold (G12): warn when benchmark.json is older.
+BENCHMARK_MAX_AGE_DAYS = 30
 
 # Per-public-id catalog facts mirrored from coordinator/server.mjs (the
 # add-a-model catalog is the source of truth — keep this table in sync).
@@ -179,6 +194,35 @@ def _parse_version(text):
     return tuple(int(part or 0) for part in match.groups())
 
 
+def _doctor_platform():
+    """(system, machine, mac_ver) for the G1/G3 checks.
+
+    DASHA_DOCTOR_TEST_PLATFORM is a test-only hook ("system:machine[:mac_ver]",
+    e.g. "Darwin:arm64:15.0") so the OS/MLX gates can be exercised off-macOS.
+    Never set it in production.
+    """
+    override = os.getenv("DASHA_DOCTOR_TEST_PLATFORM")
+    if override is not None:
+        parts = override.split(":")
+        system = parts[0] if len(parts) > 0 and parts[0] else platform.system()
+        machine = parts[1] if len(parts) > 1 and parts[1] else platform.machine()
+        mac_ver = parts[2] if len(parts) > 2 else ""
+        return system, machine, mac_ver
+    system, machine = platform.system(), platform.machine()
+    mac_ver = platform.mac_ver()[0] if system == "Darwin" else ""
+    return system, machine, mac_ver
+
+
+def _install_dir():
+    """The install.sh APP_DIR. doctor doubles as a pre-install checker, so
+    the post-install checks (G9/G10/G12) gate on provider.env existing."""
+    return os.path.expanduser("~/Library/Application Support/Dasha Compute")
+
+
+def _doctor_installed():
+    return os.path.isfile(os.path.join(_install_dir(), "provider.env"))
+
+
 def _unified_memory_gb():
     # DASHA_DOCTOR_TEST_MEMORY_GB is a test-only hook so the memory-fit check
     # can be exercised without a real 8 GB Mac. Never set it in production.
@@ -230,7 +274,58 @@ def _missing_model_size_gb(public_id, tag):
     return _estimate_tag_size_gb(tag)
 
 
+def _classify_connection_error(error):
+    """G8: turn raw urlopen connection failures into readable doctor lines.
+
+    Returns (detail, remediation) for the classified kinds (TLS, refused,
+    timeout) or None when the error is something else (HTTP errors and DNS
+    oddities keep their existing generic reporting).
+    """
+    chain, seen = error, set()
+    while chain is not None and id(chain) not in seen and len(seen) < 10:
+        seen.add(id(chain))
+        if isinstance(chain, ssl.SSLCertVerificationError):
+            return (
+                "TLS verification failed — check date/time and that no VPN/proxy intercepts traffic",
+                "fix the clock (System Settings → Date & Time), then re-run: dasha-compute doctor",
+            )
+        if isinstance(chain, ssl.SSLError):
+            return (
+                "TLS handshake failed — a proxy or captive portal may be intercepting traffic",
+                "check VPN/proxy settings, then re-run: dasha-compute doctor",
+            )
+        if isinstance(chain, ConnectionRefusedError):
+            return (
+                f"connection refused — coordinator down or URL wrong (DASHA_COORDINATOR_URL={COORDINATOR})",
+                "check the coordinator URL, then re-run: dasha-compute doctor",
+            )
+        if isinstance(chain, (socket.timeout, TimeoutError)):
+            return (
+                "timed out after 5s — firewall or DNS blocking?",
+                "check network/VPN/DNS, then re-run: dasha-compute doctor",
+            )
+        chain = getattr(chain, "reason", None) or getattr(chain, "__cause__", None) or getattr(chain, "__context__", None)
+    return None
+
+
+def _gateway_rtt(measured_s):
+    """G13: the measured coordinator round trip, with a test-only override.
+
+    DASHA_DOCTOR_TEST_GATEWAY_RTT_S is a test-only hook so the egress-quality
+    warn threshold can be exercised without a slow network. Never set it in
+    production.
+    """
+    override = os.getenv("DASHA_DOCTOR_TEST_GATEWAY_RTT_S")
+    if override is not None:
+        try:
+            return float(override)
+        except ValueError:
+            pass
+    return measured_s
+
+
 def _check_gateway(ctx):
+    started = time.monotonic()
     if COORDINATOR.endswith("/compute/api"):
         # Live path: the verify POST is also the token check (G7). A 401 here
         # means the gateway is reachable but the key is wrong — report that as
@@ -243,20 +338,32 @@ def _check_gateway(ctx):
         except RuntimeError as error:
             if str(error).startswith("HTTP 401"):
                 ctx["key_rejected"] = True
+                ctx["gateway_ok"] = True  # it answered 401, so it is reachable
+                ctx["gateway_rtt_s"] = _gateway_rtt(time.monotonic() - started)
                 return ("pass", f"coordinator reachable — key verdict below · {COORDINATOR}", None)
             ctx["gateway_ok"] = False
             return ("fail", str(error), None)
         except Exception as error:
             ctx["gateway_ok"] = False
+            classified = _classify_connection_error(error)
+            if classified:
+                detail, remediation = classified
+                return ("fail", detail, remediation)
             return ("fail", str(error), None)
         ctx["gateway_ok"] = True
+        ctx["gateway_rtt_s"] = _gateway_rtt(time.monotonic() - started)
         return ("pass", f"{health.get('name', PROVIDER_ID)} · {COORDINATOR}", None)
     try:
         health = request_json(coordinator_path("/healthz", "/providers/verify"), timeout=5)
     except Exception as error:
         ctx["gateway_ok"] = False
+        classified = _classify_connection_error(error)
+        if classified:
+            detail, remediation = classified
+            return ("fail", detail, remediation)
         return ("fail", str(error), None)
     ctx["gateway_ok"] = True
+    ctx["gateway_rtt_s"] = _gateway_rtt(time.monotonic() - started)
     return ("pass", f"v{health.get('version', 'unknown')} · {COORDINATOR}", None)
 
 
@@ -378,17 +485,167 @@ def _check_key(ctx):
     return ("pass", "coordinator accepted the provider token", None)
 
 
+def _check_os(ctx):
+    # G1: the macOS + Apple Silicon gate. install.sh aborts on non-Darwin,
+    # but agent.py --doctor can run standalone anywhere — a Linux download
+    # should fail clearly before the provider registers.
+    system, machine, mac_ver = _doctor_platform()
+    ctx["os_system"], ctx["os_machine"], ctx["os_mac_ver"] = system, machine, mac_ver
+    if system != "Darwin":
+        return ("fail", "Dasha Compute providers require macOS", "see compute/README.md §2")
+    if machine == "arm64":
+        return ("pass", f"macOS {mac_ver or 'unknown'} on Apple Silicon", None)
+    if machine == "x86_64":
+        return ("warn", "Intel Mac detected — inference will be slow; Apple Silicon recommended", None)
+    return ("warn", f"unrecognized architecture {machine} — Apple Silicon recommended", None)
+
+
+def _check_python(ctx):
+    # G14: Python version floor, pinned in PYTHON_MIN_VERSION.
+    override = os.getenv("DASHA_DOCTOR_TEST_PYTHON_VERSION")
+    parsed = _parse_version(override) if override is not None else None
+    current = parsed if parsed is not None else sys.version_info[:3]
+    found = override if override is not None else platform.python_version()
+    floor = ".".join(str(part) for part in PYTHON_MIN_VERSION)
+    if tuple(current) >= PYTHON_MIN_VERSION:
+        return ("pass", f"{found} ≥ {floor}", None)
+    return ("fail", f"found {found}, need ≥ {floor}", "install from python.org or: brew install python@3.12")
+
+
+def _check_network(ctx):
+    # G13: light egress-quality probe — time the D2 coordinator round trip
+    # once. Advisory only: slow polls fail jobs at runtime, not in doctor.
+    if not ctx.get("gateway_ok"):
+        return ("skip", "coordinator unreachable — egress not measured", None)
+    rtt = ctx.get("gateway_rtt_s")
+    if rtt is None:
+        return ("skip", "no round-trip measurement — egress not measured", None)
+    if rtt > GATEWAY_RTT_WARN_S:
+        return ("warn", f"coordinator round trip {rtt:.1f}s (job poll needs < {GATEWAY_RTT_WARN_S:.0f}s) — check Wi-Fi / VPN", None)
+    return ("pass", f"coordinator round trip {rtt:.1f}s", None)
+
+
+def _check_mlx(ctx):
+    # G3: MLX capability flag — never fails. The line exists so the funnel
+    # can measure the MLX-capable share of provider supply.
+    system = ctx.get("os_system")
+    machine = ctx.get("os_machine")
+    mac_ver = ctx.get("os_mac_ver")
+    if system is None:
+        system, machine, mac_ver = _doctor_platform()
+    if system != "Darwin":
+        return ("skip", "MLX requires macOS — not applicable", None)
+    if machine != "arm64":
+        return ("warn", "mlx unavailable on Intel Macs", None)
+    parsed = _parse_version(mac_ver)
+    if parsed is not None and parsed >= (14, 0):
+        return ("pass", f"M-series GPU usable (macOS {mac_ver})", None)
+    return ("warn", f"mlx needs macOS ≥ 14 (this Mac: {mac_ver or 'unknown'})", "upgrade macOS to enable the MLX backend")
+
+
+def _check_service(ctx):
+    # G9: LaunchAgent / service state — post-install only. doctor doubles as
+    # a pre-install checker in install.sh, so skip when provider.env is
+    # absent (the source-tree case).
+    if not _doctor_installed():
+        return ("skip", "not installed — service check runs post-install", None)
+    app_dir = _install_dir()
+    for rel in ("agent.py", "provider.env"):
+        if not os.path.isfile(os.path.join(app_dir, rel)):
+            return ("fail", f"{os.path.join(app_dir, rel)} missing", "re-run install.sh")
+    cli = os.path.expanduser("~/bin/dasha-compute")
+    if not os.path.isfile(cli):
+        return ("fail", f"{cli} missing", "re-run install.sh")
+    # DASHA_DOCTOR_TEST_LAUNCHCTL is a test-only hook ("loaded" | "stopped" |
+    # "missing") so the launchctl branch is exercisable off-macOS. Never set
+    # it in production.
+    hook = os.getenv("DASHA_DOCTOR_TEST_LAUNCHCTL")
+    if hook == "loaded":
+        return ("pass", f"LaunchAgent {PROVIDER_LABEL} loaded", None)
+    if hook == "stopped":
+        return ("pass", f"LaunchAgent {PROVIDER_LABEL} installed but not running — run: dasha-compute start", None)
+    if hook == "missing":
+        return ("fail", f"LaunchAgent {PROVIDER_LABEL} missing or not bootstrapped", "run: dasha-compute start")
+    if platform.system() != "Darwin":
+        return ("skip", "LaunchAgent is macOS-only", None)
+    try:
+        out = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{PROVIDER_LABEL}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, ValueError) as error:
+        return ("fail", f"launchctl unavailable ({error})", "run: dasha-compute start")
+    if out.returncode != 0:
+        return ("fail", f"LaunchAgent {PROVIDER_LABEL} missing or not bootstrapped", "run: dasha-compute start")
+    state = "running" if "state = running" in out.stdout else "installed but not running — run: dasha-compute start"
+    return ("pass", f"LaunchAgent {PROVIDER_LABEL} {state}", None)
+
+
+def _check_keychain(ctx):
+    # G10: Keychain readability of the provider token — post-install only.
+    # run-provider reads it via `security find-generic-password` at every
+    # start; a missing/denied item crash-loops the service silently. The
+    # token itself is never printed — only whether the read succeeded.
+    if not _doctor_installed():
+        return ("skip", "not installed — Keychain check runs post-install", None)
+    # DASHA_DOCTOR_TEST_KEYCHAIN is a test-only hook ("ok" | "denied").
+    # Never set it in production.
+    hook = os.getenv("DASHA_DOCTOR_TEST_KEYCHAIN")
+    if hook == "ok":
+        return ("pass", "provider token readable from Keychain", None)
+    if hook == "denied":
+        return ("fail", "cannot read the stored provider token", "re-run install.sh or check Keychain access prompts")
+    if platform.system() != "Darwin":
+        return ("skip", "Keychain is macOS-only", None)
+    try:
+        out = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-a", PROVIDER_ID, "-s", PROVIDER_LABEL, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, ValueError) as error:
+        return ("fail", f"security tool unavailable ({error})", "re-run install.sh")
+    if out.returncode != 0:
+        return ("fail", "cannot read the stored provider token", "re-run install.sh or check Keychain access prompts")
+    return ("pass", "provider token readable from Keychain", None)
+
+
+def _check_benchmark(ctx):
+    # G12: benchmark freshness — a Mac that degrades after install keeps
+    # advertising stale throughput. Warn-only; missing file is info.
+    if not _doctor_installed():
+        return ("skip", "not installed — benchmark check runs post-install", None)
+    path = os.getenv("DASHA_BENCHMARK_PATH")
+    if not path:
+        return ("skip", "DASHA_BENCHMARK_PATH not set — no benchmark configured", None)
+    try:
+        with open(path, encoding="utf-8") as source:
+            measured_ms = json.load(source)["measured_at"]
+    except (OSError, ValueError, KeyError):
+        return ("skip", f"no benchmark.json at {path} yet", "run: dasha-compute benchmark")
+    age_days = (time.time() * 1000 - measured_ms) / 86400_000
+    if age_days > BENCHMARK_MAX_AGE_DAYS:
+        return ("warn", f"benchmark.json is {age_days:.0f} days old", "refresh with: dasha-compute benchmark")
+    return ("pass", f"benchmark.json is {age_days:.0f} days old", None)
+
+
 # Check registry: (machine name, display area, check fn). Each fn takes a
 # shared ctx dict (earlier checks stash facts later checks reuse) and returns
 # (status, detail, remediation) with status in pass|fail|warn|skip.
 DOCTOR_CHECKS = [
+    ("os", "os", _check_os),
+    ("python", "python", _check_python),
     ("gateway", "gateway", _check_gateway),
+    ("network", "network", _check_network),
     ("ollama", "ollama", _check_ollama),
     ("ollama-version", "ollama-version", _check_ollama_version),
     ("models", "models", _check_models),
     ("disk", "disk", _check_disk),
     ("memory-fit", "models", _check_memory_fit),
+    ("mlx", "mlx", _check_mlx),
     ("key", "key", _check_key),
+    ("service", "service", _check_service),
+    ("keychain", "keychain", _check_keychain),
+    ("benchmark", "benchmark", _check_benchmark),
 ]
 
 
