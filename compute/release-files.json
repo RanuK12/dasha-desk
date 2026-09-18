@@ -19,6 +19,7 @@
   "examples/chat.py",
   "index.html",
   "install.sh",
+  "mcp-tool-catalog.json",
   "package.json",
   "pnpm-lock.yaml",
   "provider/agent.py",
