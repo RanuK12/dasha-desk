@@ -52,20 +52,19 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: compute/dist/dasha-compute-open-alpha.tar.gz
-      - name: Publish archive for the edge Worker
+      - name: Publish release assets on main (no binaries committed to git)
         if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p artifacts/dasha-compute
-          cp compute/dist/dasha-compute-open-alpha.tar.gz \
-             compute/dist/dasha-compute-open-alpha.tar.gz.sha256 \
-             compute/dist/release.json \
-             artifacts/dasha-compute/
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add artifacts/dasha-compute
-          if git diff --cached --quiet; then
-            echo "artifacts unchanged"
-            exit 0
+          TAG="compute-${GITHUB_SHA::8}"
+          SHA256=$(cut -d' ' -f1 compute/dist/dasha-compute-open-alpha.tar.gz.sha256)
+          NOTES="Deterministic compute release built from ${GITHUB_SHA}.
+          SHA256 (dasha-compute-open-alpha.tar.gz): ${SHA256}
+          Attested with actions/attest (SLSA); workflow artifact retained 30 days."
+          FILES="compute/dist/dasha-compute-open-alpha.tar.gz compute/dist/dasha-compute-open-alpha.tar.gz.sha256 compute/dist/release.json"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $FILES --clobber
+          else
+            gh release create "$TAG" --title "Compute release ${GITHUB_SHA::8}" --notes "$NOTES" --latest=false $FILES
           fi
-          git commit -m "Publish Compute provenance archive for edge download"
-          git push

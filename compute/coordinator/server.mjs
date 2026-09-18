@@ -5,8 +5,13 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 // PORT=0 is honored so tests can ask the OS for a race-free ephemeral port
 // (the old freePort-then-spawn pattern let two coordinators collide).
 const port = process.env.PORT === undefined || process.env.PORT === "" ? 8787 : Number(process.env.PORT);
-const consumerKey = process.env.DASHA_API_KEY || "dasha-local-consumer";
-const providerKey = process.env.DASHA_PROVIDER_KEY || "dasha-local-provider";
+// Public default keys are a loopback-only convenience. Binding a non-loopback
+// interface with them would expose the consumer/provider APIs to the network
+// with credentials anyone can guess. Guarded again below before listen().
+const DEFAULT_CONSUMER_KEY = "dasha-local-consumer";
+const DEFAULT_PROVIDER_KEY = "dasha-local-provider";
+const consumerKey = process.env.DASHA_API_KEY || DEFAULT_CONSUMER_KEY;
+const providerKey = process.env.DASHA_PROVIDER_KEY || DEFAULT_PROVIDER_KEY;
 const corsOrigin = process.env.DASHA_CORS_ORIGIN || "";
 const jobTimeoutMs = Math.max(5_000, Number(process.env.JOB_TIMEOUT_MS || 120_000));
 const maxBodyBytes = 256 * 1024;
@@ -342,6 +347,16 @@ const server = http.createServer(async (request, response) => {
     return send(response, Number(error.status || 500), { error: { message: error.status ? error.message : "internal error", type: error.status ? "invalid_request_error" : "server_error" } });
   }
 });
+// Refuse to start on a non-loopback interface with the public default keys.
+// Local runs keep the convenient defaults; anything reachable from the
+// network must set DASHA_API_KEY and DASHA_PROVIDER_KEY explicitly.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+if (!LOOPBACK_HOSTS.has(bindHost) && (consumerKey === DEFAULT_CONSUMER_KEY || providerKey === DEFAULT_PROVIDER_KEY)) {
+  process.stderr.write(
+    `refusing to start: HOST=${bindHost} is not loopback but DASHA_API_KEY/DASHA_PROVIDER_KEY are still the public defaults — set real keys\n`
+  );
+  process.exit(1);
+}
 server.listen(port, bindHost, () => {
   const address = server.address();
   const actualPort = typeof address === "object" && address !== null ? address.port : port;

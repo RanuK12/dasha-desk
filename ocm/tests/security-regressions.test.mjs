@@ -10,7 +10,7 @@ import {
   MemoryAccounts,
   normalizeEmail,
 } from '../gateway/accounts.mjs';
-import { createGateway } from '../gateway/server.mjs';
+import { createGateway, sessionSecretStatus } from '../gateway/server.mjs';
 import { issueSession, readSession } from '../gateway/session.mjs';
 import { WsConnection } from '../gateway/ws.mjs';
 
@@ -96,6 +96,18 @@ test('the old public session fallback cannot forge a current local session', () 
     accountId: 'acct_test',
     credentialId: 'cred_test',
   }, 'the process-local fallback must still support local sessions within one run');
+});
+
+test('sessionSecretStatus flags the placeholder fallback the startup warning keys on', () => {
+  // Same runtime-built literal: the scanner must not mistake this negative
+  // fixture for a credential. The denylist behavior in session.mjs is
+  // untouched — this only pins what the startup warning treats as "no real
+  // secret configured".
+  const historicalFallback = ['dev', 'session', 'secret'].join('-');
+  assert.equal(sessionSecretStatus(undefined), 'placeholder', 'unset env must warn');
+  assert.equal(sessionSecretStatus(''), 'placeholder', 'empty env must warn');
+  assert.equal(sessionSecretStatus(historicalFallback), 'placeholder', 'dev fallback must warn');
+  assert.equal(sessionSecretStatus('a-long-random-production-secret'), 'configured');
 });
 
 test('email labels are normalized but are not account-recovery credentials', async () => {
