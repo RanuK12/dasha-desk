@@ -5,14 +5,16 @@
  * Live /chess still ships unused leftover id=buy-share-x in the hidden
  * buy-flash after the buy-share-tg strip. Worker polish should drop it.
  *
- * Official Dasha Telegram stays: https://t.me/+xB7S8mIQaKFiZjRh
+ * Official Dasha Telegram stays: https://t.me/+ck9pUjL2ncNiZjRh
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-export const OFFICIAL_TG = 'https://t.me/+xB7S8mIQaKFiZjRh';
+// Must match leftover-lobby.test.mjs. Canonical group supplied by the owner on
+// 2026-09-15 (Uuriko/dasha-desk #198).
+export const OFFICIAL_TG = 'https://t.me/+ck9pUjL2ncNiZjRh';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const read = (rel) => readFileSync(join(root, rel), 'utf8');

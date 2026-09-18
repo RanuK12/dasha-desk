@@ -2,7 +2,7 @@
 /**
  * Leftover lock after style+script strip.
  *
- * Official Dasha Telegram stays: https://t.me/+xB7S8mIQaKFiZjRh
+ * Official Dasha Telegram stays: https://t.me/+ck9pUjL2ncNiZjRh
  * Footer (and other intentional community chrome) may use that exact invite.
  * Invented groups fail. Quiet pin may not dump mint/Buy/Chess/TG.
  *
@@ -14,7 +14,10 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-export const OFFICIAL_TG = 'https://t.me/+xB7S8mIQaKFiZjRh';
+// Watch allowlist: the one official Dasha Telegram invite. The owner replaced the
+// previous invite with this canonical group on 2026-09-15 (Uuriko/dasha-desk #198).
+// Any other t.me / telegram.me href is rejected as an invented group.
+export const OFFICIAL_TG = 'https://t.me/+ck9pUjL2ncNiZjRh';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const read = (rel) => readFileSync(join(root, rel), 'utf8');

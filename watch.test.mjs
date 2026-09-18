@@ -168,7 +168,7 @@ assert.equal(baseline.failures.length, 0, `good fixtures must pass:\n${baseline.
     probe: overlay(good, {
       [`${ORIGIN}/chess`]: {
         status: 200,
-        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><footer><a href="https://t.me/+xB7S8mIQaKFiZjRh">Telegram</a></footer>',
+        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><footer><a href="https://t.me/+ck9pUjL2ncNiZjRh">Telegram</a></footer>',
       },
     }),
     skipPages: true,
@@ -245,7 +245,7 @@ assert.equal(baseline.failures.length, 0, `good fixtures must pass:\n${baseline.
     probe: overlay(good, {
       [`${ORIGIN}/lobby`]: {
         status: 200,
-        body: '<!doctype html><h1>Lobby</h1><p>The one community room.</p><footer><a href="https://t.me/+xB7S8mIQaKFiZjRh">Telegram</a></footer>',
+        body: '<!doctype html><h1>Lobby</h1><p>The one community room.</p><footer><a href="https://t.me/+ck9pUjL2ncNiZjRh">Telegram</a></footer>',
       },
     }),
     skipPages: true,
@@ -258,7 +258,7 @@ assert.equal(baseline.failures.length, 0, `good fixtures must pass:\n${baseline.
     probe: overlay(good, {
       [`${ORIGIN}/lobby`]: {
         status: 200,
-        body: '<!doctype html><h1>Lobby</h1><p>The one community room.</p><p class="forum-pin"><span class="forum-ca">53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump</span> <a href="https://t.me/+xB7S8mIQaKFiZjRh">TG</a></p>',
+        body: '<!doctype html><h1>Lobby</h1><p>The one community room.</p><p class="forum-pin"><span class="forum-ca">53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump</span> <a href="https://t.me/+ck9pUjL2ncNiZjRh">TG</a></p>',
       },
     }),
     skipPages: true,
@@ -297,7 +297,7 @@ assert.equal(baseline.failures.length, 0, `good fixtures must pass:\n${baseline.
     probe: overlay(good, {
       [`${ORIGIN}/chess`]: {
         status: 200,
-        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><footer><a href="https://t.me/+xB7S8mIQaKFiZjRh">Telegram</a></footer>',
+        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><footer><a href="https://t.me/+ck9pUjL2ncNiZjRh">Telegram</a></footer>',
       },
     }),
     skipPages: true,
@@ -310,7 +310,7 @@ assert.equal(baseline.failures.length, 0, `good fixtures must pass:\n${baseline.
     probe: overlay(good, {
       [`${ORIGIN}/chess`]: {
         status: 200,
-        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><a id="buy-share-tg" href="https://t.me/+xB7S8mIQaKFiZjRh">TG</a>',
+        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><a id="buy-share-tg" href="https://t.me/+ck9pUjL2ncNiZjRh">TG</a>',
       },
     }),
     skipPages: true,
