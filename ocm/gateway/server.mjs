@@ -303,6 +303,32 @@ export async function createGateway({
   }
   await ledger.init();
 
+  // Accounting gate (review P1-3, roadmap R7). The ledgers mark themselves unhealthy
+  // on a write failure, but a request that passed the balance check before that
+  // moment is already in flight; it used to complete as a 200 with a `usage` block
+  // the ledger never recorded. The gateway now keeps its own record of the first
+  // job whose usage could not be written and closes the gate at once: /healthz
+  // reports it (503, so the ALB pulls the target) and every later chat request is
+  // refused before dispatch. Nothing reopens the gate in-process; recovery is a
+  // restart after the ledger is repaired, exactly as for the ledgers' own state.
+  let accountingFailure = null;
+  const accountingFailed = ({ jobId, consumer, host, completionTokens, error }) => {
+    console.error(JSON.stringify({ level: 'error', msg: 'LEDGER WRITE FAILED — accounting gate closed',
+      jobId, consumer, host, completionTokens, error: String(error) }));
+    if (!accountingFailure) accountingFailure = { jobId, at: new Date().toISOString() };
+  };
+  // Public-safe: the ledger's own health is reduced to `ok`, and the gateway adds
+  // only its own job id and timestamp. Field names are additive so /healthz keeps
+  // its shape for anything already reading it.
+  const accountingHealth = () => {
+    const health = publicAccountingHealth(ledger);
+    if (!accountingFailure) return health;
+    return { ...health, ok: false, unrecorded_job: accountingFailure.jobId, closed_at: accountingFailure.at };
+  };
+  const ACCOUNTING_UNAVAILABLE = {
+    error: { type: 'accounting_unavailable', message: 'response produced but usage could not be recorded' },
+  };
+
   // Accounts: Postgres-backed in production, in-memory for tests. Credentials are
   // stored only as SHA-256 hashes and are account-bound and revocable.
   let accounts;
@@ -718,7 +744,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         }
       }
       if (req.method === 'GET' && url.pathname === '/healthz') {
-        const accounting = publicAccountingHealth(ledger);
+        const accounting = accountingHealth();
         return json(res, accounting.ok ? 200 : 503, {
           ok: accounting.ok,
           service: 'ocm-gateway',
@@ -834,6 +860,12 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
     const key = bearer(req);
     const consumer = await resolveConsumer(key);
     if (!consumer) return apiError(res, 401, 'invalid api key', 'authentication_error');
+    // Fail closed before dispatch once any usage has gone unrecorded (or the ledger
+    // itself is unhealthy): an honest 503 here, not a generic 500 from balance().
+    if (!accountingHealth().ok) {
+      return apiError(res, 503, 'accounting is unavailable; requests are refused until the gateway recovers',
+        'accounting_unavailable');
+    }
     if ((await ledger.balance(consumer)) <= 0) {
       const fresh = (await ledger.grantCount(consumer)) === 0;
       return apiError(res, 402, fresh
@@ -936,17 +968,42 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
       };
 
       // Bill only what reached the client, and only ever the gateway's own count.
-      // The ledgers are idempotent by jobId and mark accounting unhealthy on a
-      // write/database failure, which makes subsequent balance checks fail closed.
+      // The ledgers are idempotent by jobId. If the write fails this closes the
+      // gateway's accounting gate and THROWS: every caller below decides what the
+      // client is told, and none of them may report success (review P1-3, R7).
+      // Settlement is claimed exactly once per job, so clear is attempted at most
+      // once; a failed attempt is never retried here, and a client retry is a new
+      // job with a new id, so nothing can double-debit or double-credit.
       const meter = async () => {
         const completionTokens = countTokens(text);
         try {
           await ledger.clear({ consumer, host: host.id, model, promptTokens, completionTokens, jobId });
         } catch (err) {
-          console.error(JSON.stringify({ level: 'error', msg: 'LEDGER WRITE FAILED — accounting disabled',
-            jobId, consumer, host: host.id, completionTokens, error: String(err) }));
+          accountingFailed({ jobId, consumer, host: host.id, completionTokens, error: err });
+          throw err;
         }
         return completionTokens;
+      };
+
+      // A response was produced but its usage could not be recorded. The generated
+      // text is DROPPED: the consumer is not charged, the provider is not credited,
+      // and the client is not handed an unaccounted completion as a 200. Nothing has
+      // shipped for a non-stream request (or a stream that never got a chunk), so it
+      // gets a plain 503 in the usual error envelope. Bytes already written to a
+      // stream cannot be unsent; the honest move left is to withhold [DONE] and end
+      // with an SSE `error` event carrying the same envelope, so a well-behaved
+      // client knows the completion is unaccounted rather than complete.
+      const unaccounted = () => {
+        try {
+          if (committed) {
+            res.write(`event: error\ndata: ${JSON.stringify(ACCOUNTING_UNAVAILABLE)}\n\n`);
+            res.end();
+          } else {
+            committed = true;
+            json(res, 503, ACCOUNTING_UNAVAILABLE);
+          }
+        } catch {}
+        finish({ ok: false, committed: true, unaccounted: true });
       };
 
       const onClientGone = () => {
@@ -955,7 +1012,8 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         const wasCommitted = committed;
         if (!claimSettlement()) return;
         if (!wasCommitted) return finish({ ok: false, committed: false, aborted: true });
-        void meter().finally(() => finish({ ok: false, committed: true, aborted: true }));
+        // Nobody is left to tell; meter() has already closed the gate on failure.
+        void meter().catch(() => {}).finally(() => finish({ ok: false, committed: true, aborted: true }));
       };
 
       const timer = setTimeout(() => {
@@ -964,10 +1022,10 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         const wasCommitted = committed;
         if (!claimSettlement()) return;
         if (!wasCommitted) return finish({ ok: false, committed: false });
-        void meter().finally(() => {
+        meter().then(() => {
           try { res.end(); } catch {}
           finish({ ok: false, committed: true });
-        });
+        }, unaccounted);
       }, registry.isWarm(host, wireModel) ? JOB_TIMEOUT_MS : COLD_JOB_TIMEOUT_MS);
 
       host.inflight.set(jobId, {
@@ -1004,21 +1062,23 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         },
         async onDone() {
           if (!claimSettlement()) return;
+          // Record first, then answer: a 200 (or [DONE]) is a claim that the usage
+          // it reports exists in the ledger, so it cannot be written before it does.
+          let completionTokens;
+          try { completionTokens = await meter(); }
+          catch { return unaccounted(); }
           if (stream) {
             if (!committed) {
               committed = true;
               res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
             }
-            const completionTokens = await meter();
             res.write(`data: ${JSON.stringify({
               id: chatId, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
             })}\n\n`);
             res.write('data: [DONE]\n\n');
             res.end();
-            void completionTokens;
           } else {
-            const completionTokens = await meter();
             committed = true;
             json(res, 200, {
               id: chatId, object: 'chat.completion', created, model,
@@ -1033,8 +1093,9 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
           const wasCommitted = committed;
           if (!claimSettlement()) return;
           if (wasCommitted) {
-            // Mid-stream failure: close the stream cleanly and bill what shipped.
-            await meter();
+            // Mid-stream failure: bill what shipped, then close the stream cleanly.
+            try { await meter(); }
+            catch { return unaccounted(); }
             if (stream) { res.write('data: [DONE]\n\n'); res.end(); }
             finish({ ok: false, committed: true });
           } else {
