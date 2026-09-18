@@ -194,13 +194,23 @@
       box.textContent = 'Exact match — this is the associated mint.';
       return;
     }
-    if (raw.length >= 32 && raw.length <= 50 && /^[1-9A-HJ-NP-Za-km-z]+$/.test(raw)) {
+    /* Solana addresses are 32-44 chars of base58. A well-formed-but-different
+       address is "not the mint"; anything else is "not an address at all". */
+    if (raw.length >= 32 && raw.length <= 44 && /^[1-9A-HJ-NP-Za-km-z]+$/.test(raw)) {
       box.className = 'dd-verify bad';
       box.textContent = 'Does not match the associated mint.';
       return;
     }
     box.className = 'dd-verify warn';
     box.textContent = 'Not a Solana mint format.';
+  }
+
+  /* null/undefined/''/NaN mean "no data" — never let them become 0, which
+     money() would print as $0.00 and read as a fact about the token. */
+  function num(v) {
+    if (v == null || v === '') return null;
+    var n = Number(v);
+    return isFinite(n) ? n : null;
   }
 
   function money(n) {
@@ -229,10 +239,10 @@
 
   function paintPair(pair) {
     if (!pair) return;
-    var price = Number(pair.priceUsd);
-    var mcap = Number(pair.marketCap || pair.fdv);
-    var liq = pair.liquidity && Number(pair.liquidity.usd);
-    var ch = pair.priceChange && Number(pair.priceChange.h24);
+    var price = num(pair.priceUsd);
+    var mcap = num(pair.marketCap || pair.fdv);
+    var liq = pair.liquidity ? num(pair.liquidity.usd) : null;
+    var ch = pair.priceChange ? num(pair.priceChange.h24) : null;
     if ($('s-price')) $('s-price').textContent = money(price);
     if ($('s-mcap')) $('s-mcap').textContent = money(mcap);
     if ($('s-liq')) $('s-liq').textContent = money(liq);
@@ -259,6 +269,11 @@
 
   var lastOk = 0;
   var ageClock = 0;
+  /* Consecutive Dex fetch failures. Drives the poll backoff below: each
+     failure doubles the wait, a success resets it. */
+  var pollFails = 0;
+  var POLL_BASE_MS = 60000;
+  var POLL_MAX_MS = 30 * 60000;
 
   function paintAge() {
     var el = $('dd-age');
@@ -313,8 +328,10 @@
         }
         paintPair(best);
         markOk();
+        pollFails = 0;
       })
       .catch(function () {
+        pollFails += 1;
         clearPair('Dex unavailable · use sources below', 'offline');
         paintAge();
       })
@@ -355,10 +372,22 @@
       el.className = 'dd-visit' + (stamp.mintChanged ? ' dd-visit-warn' : '');
     } catch (e) {}
   })();
-  var poll = setInterval(function () {
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-    refresh();
-  }, 60000);
+  /* Poll with exponential backoff: the desk refetches Dex forever, and during a
+     long outage a fixed 60s cadence spends quota and attention for no new
+     information. Each consecutive failure doubles the wait from 60s up to a
+     30-minute ceiling; one success resets it. The manual refresh button and
+     the tab-visible nudge still fire immediately. */
+  function pollDelay() {
+    return Math.min(POLL_BASE_MS * Math.pow(2, Math.min(pollFails, 6)), POLL_MAX_MS);
+  }
+  (function schedulePoll() {
+    setTimeout(function () {
+      if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
+        refresh();
+      }
+      schedulePoll();
+    }, pollDelay());
+  })();
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', function () {
       if (document.visibilityState === 'visible') refresh();

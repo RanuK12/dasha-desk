@@ -205,4 +205,55 @@ assert.ok(src.includes('DDShare') && src.includes('buildSharePack'), 'DDShare ex
   assert.equal(elements['dd-age'].textContent, ageAfterOk, 'failed refresh must not reset age to a new just-now');
 }
 
+// Null numerics from Dex must paint '—', never $0.00. Number(null) === 0, so a
+// Dex response with null price/marketCap once rendered $0.00 — which reads as
+// a fact about the token and contradicts this page's own honesty tests.
+{
+  const elements = new Proxy({}, {
+    get(store, id) {
+      if (!store[id]) store[id] = {
+        textContent: '',
+        value: '',
+        hidden: false,
+        style: { removeProperty(name) { delete this[name]; } },
+        listeners: {},
+        addEventListener(type, fn) { this.listeners[type] = fn; },
+      };
+      return store[id];
+    },
+  });
+  const dom = {
+    globalThis: null,
+    document: { getElementById: id => elements[id], addEventListener() {}, visibilityState: 'visible' },
+    navigator: {},
+    URL,
+    console,
+    isFinite,
+    AbortController,
+    clearTimeout() {},
+    setTimeout() { return 1; },
+    setInterval() { return 1; },
+    fetch: async () => ({
+      ok: true,
+      json: async () => ({
+        pairs: [{
+          priceUsd: null,
+          marketCap: null,
+          liquidity: { usd: null },
+          priceChange: { h24: null },
+          dexId: 'test',
+        }],
+      }),
+    }),
+  };
+  dom.globalThis = dom;
+  vm.runInNewContext(src, dom, { filename: 'src/app.js' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(
+    ['s-price', 's-mcap', 's-liq', 's-24h'].map(id => elements[id].textContent),
+    ['—', '—', '—', '—'],
+    'null Dex numerics painted a number instead of —'
+  );
+}
+
 console.log('dasha-share.test.mjs: PASS (trust-reset)');

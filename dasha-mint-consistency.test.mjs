@@ -42,4 +42,12 @@ for (const [name, text] of [['body.html', body], ['app.js', app]]) {
   }
 }
 
+/* The Desk's paste-verify uses the same well-formed window the chain scan above
+   does: 32-44 base58 chars. It once accepted 45-50 chars as "does not match the
+   associated mint" — wrong, since those are not Solana addresses at all. */
+assert.ok(
+  /raw\.length >= 32 && raw\.length <= 44 &&/.test(app),
+  'src/app.js verify() well-formed window is not 32-44'
+);
+
 console.log('dasha-mint-consistency: PASS');
