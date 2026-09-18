@@ -258,8 +258,11 @@ test('P2-4: tokens are granted only when a configured invite code matches', asyn
     const acct = (await gw.accounts.listAccounts()).find((a) => a.email === 'plain@example.test');
     assert.equal(await gw.ledger.balance(acct.id), 0, 'no grant without a configured code');
     const cookie = (plain.headers.get('set-cookie') || '').split(';')[0];
+    const dash = await (await fetch(`${base}/console/`, { headers: { cookie } })).text();
+    const csrf = dash.match(/name="csrf" value="([^"]+)"/)[1];   // P2-9: signed-in forms carry it
     const redeem = await fetch(`${base}/console/redeem`, { method: 'POST', redirect: 'manual',
-      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie }, body: 'invite=anything' });
+      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie },
+      body: new URLSearchParams({ csrf, invite: 'anything' }).toString() });
     assert.equal(redeem.status, 302);
     assert.match(redeem.headers.get('location'), /error=/);
     assert.equal(await gw.ledger.balance(acct.id), 0, 'redeem cannot grant either');

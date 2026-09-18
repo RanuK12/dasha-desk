@@ -528,11 +528,18 @@ function startConsole(opts = {}) {
   }).then(ready);
 }
 
-const form = (gw, path, fields, cookie) => fetch(`${gw.base}/console${path}`, {
+// A signed-in form carries the session's CSRF token (P2-9), read from the dashboard
+// the way a browser would; csrf.test.mjs proves the token is required.
+const csrfFor = async (gw, cookie) => {
+  const html = await (await fetch(`${gw.base}/console/`, { headers: { cookie } })).text();
+  return (html.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+};
+
+const form = async (gw, path, fields, cookie) => fetch(`${gw.base}/console${path}`, {
   method: 'POST', redirect: 'manual',
   headers: { 'content-type': 'application/x-www-form-urlencoded',
              ...(cookie ? { cookie } : {}) },
-  body: new URLSearchParams(fields).toString(),
+  body: new URLSearchParams(cookie ? { csrf: await csrfFor(gw, cookie), ...fields } : fields).toString(),
 });
 
 test('signup refuses an existing email and issues nothing (no takeover by address)', async () => {

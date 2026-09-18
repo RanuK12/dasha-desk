@@ -16,9 +16,9 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
 import { createMailer, recoveryMessage, maskEmail } from './mail.mjs';
-import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderDeveloperGuide, renderProfile, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderRateLimited, renderEnrollment, renderStatus } from './console.mjs';
+import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderDeveloperGuide, renderProfile, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderRateLimited, renderEnrollment, renderStatus, renderRefused } from './console.mjs';
 import { RateLimiter, clientIp, keyPrefixIdentifier, emailIdentifier } from './ratelimit.mjs';
-import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
+import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm, csrfToken, csrfOk } from './session.mjs';
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
 import { normalizeChatRequest } from './request.mjs';
@@ -400,7 +400,8 @@ export async function createGateway({
         // A session is only as valid as the credential that opened it: revoking a
         // key must sign out its browser session too, or "revoked" means one thing
         // for the API and something weaker for the console.
-        const claim = readSession(sessionSecret, readCookie(req.headers.cookie));
+        const sessionCookie = readCookie(req.headers.cookie);
+        const claim = readSession(sessionSecret, sessionCookie);
         let account = null;
         if (claim && await accounts.credentialActive(claim.credentialId)) {
           account = await accounts.accountFor(claim.accountId);
@@ -408,10 +409,41 @@ export async function createGateway({
           res.setHeader('set-cookie', clearCookieHeader({ secure: secureCookies }));
         }
 
+        // ---- cross-site request forgery (review P2-9) -------------------------
+        // Two layers. Every console POST is refused when the browser says it came
+        // from another site: `Sec-Fetch-Site: cross-site`, or an `Origin` whose host
+        // is not the one the request arrived on (`Origin: null` counts as foreign).
+        // Absent headers are allowed: nothing in scripts/ or agent/ posts to the
+        // console, but the suite and any operator's curl do, and neither sends
+        // Origin, so this layer guards the pre-session forms (sign-in, sign-up,
+        // recovery) without making them browser-only. Signed-in forms carry a
+        // per-session token as well, checked in each handler below: a request
+        // with a valid cookie but no matching token is refused before it acts.
+        // The /admin/* bearer API is outside this block and unaffected.
+        const csrf = account ? csrfToken(sessionSecret, sessionCookie) : '';
+        // True once the 403 has been written; the caller returns without acting.
+        const refuseCsrf = (f) => {
+          if (csrfOk(sessionSecret, sessionCookie, f.csrf)) return false;
+          html(res, 403, renderRefused({ reason: 'This form was not submitted from your console session. Nothing was changed.' }));
+          return true;
+        };
+        if (req.method === 'POST') {
+          const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+          const origin = req.headers.origin;
+          let foreign = site === 'cross-site';
+          if (!foreign && origin !== undefined) {
+            try { foreign = new URL(origin).host.toLowerCase() !== String(req.headers.host || '').toLowerCase(); }
+            catch { foreign = true; }
+          }
+          if (foreign) {
+            return html(res, 403, renderRefused({ reason: 'This request came from another site. Nothing was changed.' }));
+          }
+        }
+
         if (req.method === 'GET' && consolePath === '/') {
           return account
             ? html(res, 200, await renderDashboard({ registry, ledger, accounts, account, apiHost,
-                admin: isAdmin(account),
+                admin: isAdmin(account), csrf,
                 redeemed: (await ledger.grantCount(account.id)) > 0,
                 inviteRequired: !!inviteCode,
                 notice: url.searchParams.get('notice'),
@@ -442,7 +474,7 @@ export async function createGateway({
           // Readable signed out on purpose: it is the link prospects are sent, it
           // contains no account data, and it is the best recruiting asset we have.
           return html(res, 200, renderProviderGuide({
-            account, apiHost, models: registry.models(), admin: isAdmin(account),
+            account, apiHost, models: registry.models(), admin: isAdmin(account), csrf,
             installHash: await installSha256(),
           }));
         }
@@ -451,7 +483,7 @@ export async function createGateway({
           // The developer counterpart to /provider: the onboarding destination for
           // API consumers. Public for the same reason — no account data on it.
           return html(res, 200, renderDeveloperGuide({
-            account, apiHost, models: registry.models(), admin: isAdmin(account),
+            account, apiHost, models: registry.models(), admin: isAdmin(account), csrf,
           }));
         }
 
@@ -466,6 +498,7 @@ export async function createGateway({
           return html(res, 200, renderProfile({
             account,
             admin: isAdmin(account),
+            csrf,
             profile: {
               emailVerifiedAt: account.email_verified_at || null,
               createdAt: account.created_at || null,
@@ -491,7 +524,8 @@ export async function createGateway({
         // rather than a hint that the page exists.
         if (req.method === 'GET' && consolePath === '/network') {
           if (!isAdmin(account)) return redirect(res, '/');
-          return html(res, 200, await renderNetwork({ registry, ledger, accounts, account }));
+          return html(res, 200, await renderNetwork({ registry, ledger, accounts, account, csrf,
+            all: url.searchParams.get('all') === '1' }));
         }
 
         if (req.method === 'POST' && consolePath === '/signup') {
@@ -627,6 +661,10 @@ You are signed in with this one.</p>`,
         }
 
         if (req.method === 'POST' && consolePath === '/signout') {
+          // A live session signs out only with its token, so another site cannot
+          // log someone out. Without a session there is nothing to protect: just
+          // clear whatever cookie was sent.
+          if (account && refuseCsrf(parseForm(await readBody(req)))) return;
           res.setHeader('set-cookie', clearCookieHeader({ secure: secureCookies }));
           return redirect(res, '/');
         }
@@ -634,6 +672,7 @@ You are signed in with this one.</p>`,
         if (req.method === 'POST' && consolePath === '/redeem') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           const offered = (f.invite || '').trim();
           if (!offered) return redirect(res, '/?error=' + encodeURIComponent('Enter an invite code.'));
           if (!inviteCode || offered !== inviteCode) {
@@ -652,6 +691,7 @@ You are signed in with this one.</p>`,
         if (req.method === 'POST' && consolePath === '/keys/new') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           const kind = f.kind === 'provider_token' ? 'provider_token' : 'developer_key';
           const cred = await accounts.issue(account.id, kind, f.label || null);
           const isProvider = kind === 'provider_token';
@@ -683,6 +723,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         if (req.method === 'POST' && consolePath === '/enroll') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           const label = (f.label || '').slice(0, 64) || null;
           const enr = await accounts.issueEnrollment(account.id, label);
           // Same slug rule as /keys/new: [a-z0-9-] only, so it cannot break out of quotes.
@@ -694,6 +735,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         if (req.method === 'POST' && consolePath === '/keys/rebind') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           // Scoped to the signed-in account, so one person cannot free another's token.
           const ok = await accounts.rebind(f.credential_id, account.id);
           return redirect(res, '/?notice=' + encodeURIComponent(ok
@@ -704,6 +746,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         if (req.method === 'POST' && consolePath === '/keys/revoke') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           const creds = await accounts.listCredentials(account.id);
           // Only ever revoke a credential the signed-in account actually owns.
           if (!creds.some((c) => c.id === f.credential_id)) return redirect(res, '/');
