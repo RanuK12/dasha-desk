@@ -22,6 +22,7 @@ import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie,
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
 import { normalizeChatRequest } from './request.mjs';
+import { QuotaReservations } from './quota.mjs';
 import { AGENT_DIR, installSha256, agentSha256, shortBuild, buildState } from './agentfiles.mjs';
 
 // For the few places a secret or host name is interpolated into console HTML outside
@@ -330,6 +331,11 @@ export async function createGateway({
     ledger = new Ledger(ledgerPath);
   }
   await ledger.init();
+  // Worst-case spend is held in memory from the balance check until the job settles,
+  // so concurrent requests cannot all pass the gate on one balance (review P1-1).
+  // Settlement in the ledger stays the source of truth; this only bounds how much
+  // can be in flight at once, per gateway process.
+  const quota = new QuotaReservations();
 
   // Accounting gate (review P1-3, roadmap R7). The ledgers mark themselves unhealthy
   // on a write failure, but a request that passed the balance check before that
@@ -913,12 +919,6 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
       return apiError(res, 503, 'accounting is unavailable; requests are refused until the gateway recovers',
         'accounting_unavailable');
     }
-    if ((await ledger.balance(consumer)) <= 0) {
-      const fresh = (await ledger.grantCount(consumer)) === 0;
-      return apiError(res, 402, fresh
-        ? `this account has no granted balance — redeem an invite code at https://${consoleHost}`
-        : 'balance exhausted', 'insufficient_quota');
-    }
 
     let body;
     try { body = JSON.parse(await readBody(req)); }
@@ -947,6 +947,34 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
     }
 
     const promptTokens = countTokens(messages.map((m) => m?.content || '').join('\n'));
+
+    // Reserve the worst case this request can cost (prompt + the clamped completion
+    // budget) against the balance minus what other in-flight requests already hold.
+    // One balance read, then the hold is installed synchronously, so N concurrent
+    // requests against a balance that covers one admit exactly one (review P1-1).
+    const hold = await quota.reserve(consumer, promptTokens + maxTokens, () => ledger.balance(consumer));
+    if (!hold.ok) {
+      if (hold.balance <= 0) {
+        const fresh = (await ledger.grantCount(consumer)) === 0;
+        return apiError(res, 402, fresh
+          ? `this account has no granted balance — redeem an invite code at https://${consoleHost}`
+          : 'balance exhausted', 'insufficient_quota');
+      }
+      return apiError(res, 402, `insufficient balance for this request: ${hold.required} tokens `
+        + `(prompt + max_tokens) needed, ${hold.available} available after in-flight requests`,
+        'insufficient_quota');
+    }
+    try {
+      await dispatch({ res, model, served, substituted, messages, maxTokens, stream, consumer, promptTokens });
+    } finally {
+      // Every way a job can end resolves runJob, so this runs exactly once per
+      // request; the ledger, not the hold, records what was actually used.
+      hold.release();
+    }
+  }
+
+  /** Route one reserved request: pick a host, run it, fail over before first byte. */
+  async function dispatch({ res, model, served, substituted, messages, maxTokens, stream, consumer, promptTokens }) {
     const jobId = randomUUID();
     const created = Math.floor(Date.now() / 1000);
     const chatId = `chatcmpl-${jobId.slice(0, 12)}`;
@@ -1349,7 +1377,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
     server.close(resolve);
   });
 
-  return { server, registry, ledger, accounts, close, consumers, resolveConsumer };
+  return { server, registry, ledger, accounts, quota, close, consumers, resolveConsumer };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
