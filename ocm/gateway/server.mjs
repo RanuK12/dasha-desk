@@ -1124,27 +1124,38 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         finish({ ok: false, committed: true, unaccounted: true });
       };
 
-      const onClientGone = () => {
+      // Cancelling — because the client went away or the job timed out — frees this
+      // host's routing slot NOW, by claiming settlement, and bills exactly what had
+      // reached the client. It never waits on the host. An agent may answer the
+      // cancel with a terminal frame (R4 agents send `error: cancelled`), answer
+      // late, or never answer (older agents); by then the job is gone from
+      // `inflight`, so the socket handler drops whatever arrives without touching
+      // the slot count or the ledger (tests/cancel.test.mjs). With two slots per
+      // host, holding one until the job timeout would take half a machine out of
+      // service per abandoned request. A timeout differs from a departed client in
+      // that there is still a response to end, so a metering failure is reported
+      // to it via `unaccounted`; a departed client has nobody left to tell, and
+      // meter() has already closed the gate. A pre-token timeout may be retried on
+      // another host.
+      const cancel = ({ aborted }) => {
         if (state !== 'open') return;
         host.conn.sendJson({ t: 'cancel', id: jobId });
         const wasCommitted = committed;
         if (!claimSettlement()) return;
-        if (!wasCommitted) return finish({ ok: false, committed: false, aborted: true });
-        // Nobody is left to tell; meter() has already closed the gate on failure.
-        void meter().catch(() => {}).finally(() => finish({ ok: false, committed: true, aborted: true }));
-      };
-
-      const timer = setTimeout(() => {
-        if (state !== 'open') return;
-        host.conn.sendJson({ t: 'cancel', id: jobId });
-        const wasCommitted = committed;
-        if (!claimSettlement()) return;
-        if (!wasCommitted) return finish({ ok: false, committed: false });
+        if (!wasCommitted) return finish({ ok: false, committed: false, aborted });
+        if (aborted) {
+          void meter().catch(() => {}).finally(() => finish({ ok: false, committed: true, aborted: true }));
+          return;
+        }
         meter().then(() => {
           try { res.end(); } catch {}
-          finish({ ok: false, committed: true });
+          finish({ ok: false, committed: true, aborted: false });
         }, unaccounted);
-      }, registry.isWarm(host, wireModel) ? JOB_TIMEOUT_MS : COLD_JOB_TIMEOUT_MS);
+      };
+      const onClientGone = () => cancel({ aborted: true });
+
+      const timer = setTimeout(() => cancel({ aborted: false }),
+        registry.isWarm(host, wireModel) ? JOB_TIMEOUT_MS : COLD_JOB_TIMEOUT_MS);
 
       host.inflight.set(jobId, {
         onChunk(delta) {
@@ -1350,6 +1361,11 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         return;
       }
       host.lastSeen = Date.now();
+      // A frame for a job no longer in `inflight` — cancelled, timed out, or already
+      // settled — is dropped here, after counting as liveness. That is what lets a
+      // cancel free the slot without waiting for the host, and what makes a late
+      // `error: cancelled` from an R4 agent (or a stray `done` after it) harmless:
+      // the slot cannot be freed twice and the ledger is never touched again.
       const job = msg.id && host.inflight.get(msg.id);
       if (msg.t === 'chunk') {
         if (typeof msg.delta !== 'string') {

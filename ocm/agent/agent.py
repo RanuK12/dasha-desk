@@ -311,7 +311,19 @@ RUNTIME = _pick_runtime()
 
 
 async def run_job(ws, job, jobs):
-    """Stream one job back over the socket, honouring cancellation."""
+    """Stream one job back over the socket, honouring cancellation.
+
+    Every job ends with exactly one terminal frame, and a cancelled job is no
+    exception: it answers with `error: cancelled` the moment the cancel lands. The
+    gateway frees the host's routing slot when it sends the cancel, so this is not
+    what unblocks routing; it is what lets the gateway, and anyone reading either
+    log, tell "stopped promptly" from "never heard back" (protocol gate #5).
+
+    The wait races the runtime's queue against the cancel event, so a cancel that
+    arrives during a cold model load is answered at once rather than after the
+    first token finally shows up. The runtime itself stops at its next token, which
+    is the soonest a blocking generator can be asked to.
+    """
     job_id = job["id"]
     cancelled = jobs[job_id]
     loop = asyncio.get_running_loop()
@@ -327,19 +339,27 @@ async def run_job(ws, job, jobs):
             loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
 
     loop.run_in_executor(None, produce)
-    while True:
-        kind, value = await queue.get()
-        if cancelled.is_set():
-            break
-        if kind == "chunk":
-            await ws.send(json.dumps({"t": "chunk", "id": job_id, "delta": value}))
-        elif kind == "done":
-            await ws.send(json.dumps({"t": "done", "id": job_id}))
-            break
-        else:
-            await ws.send(json.dumps({"t": "error", "id": job_id, "message": value}))
-            break
-    jobs.pop(job_id, None)
+    stop = asyncio.ensure_future(cancelled.wait())
+    try:
+        while True:
+            item = asyncio.ensure_future(queue.get())
+            await asyncio.wait({item, stop}, return_when=asyncio.FIRST_COMPLETED)
+            if cancelled.is_set():
+                item.cancel()
+                await ws.send(json.dumps({"t": "error", "id": job_id, "message": "cancelled"}))
+                break
+            kind, value = item.result()
+            if kind == "chunk":
+                await ws.send(json.dumps({"t": "chunk", "id": job_id, "delta": value}))
+            elif kind == "done":
+                await ws.send(json.dumps({"t": "done", "id": job_id}))
+                break
+            else:
+                await ws.send(json.dumps({"t": "error", "id": job_id, "message": value}))
+                break
+    finally:
+        stop.cancel()
+        jobs.pop(job_id, None)
 
 
 def _connect(url):

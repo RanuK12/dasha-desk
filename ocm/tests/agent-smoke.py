@@ -71,6 +71,68 @@ check("_connect builds with an auth header", _connect_uses_header)
 # Every name the module references at import time must resolve.
 check("module imports cleanly", lambda: agent.RUNTIME is not None)
 
+
+# Cancellation (protocol gate #5, review P2-5). A cancelled job must still end with
+# exactly one terminal frame, sent when the cancel lands rather than when the
+# runtime's next token finally arrives, and it must leave the job table. Before R4
+# the loop simply broke, so a cancelled job was indistinguishable from a hung one.
+# The runtime is a stub, so this runs on any platform without a model.
+def _cancel_sends_one_terminal_promptly():
+    import asyncio
+    import json
+    import time
+
+    sent = []
+
+    class Socket:
+        async def send(self, text):
+            sent.append(json.loads(text))
+
+    class SlowRuntime:
+        name = "stub"
+
+        def stream(self, model, messages, cancelled, max_tokens=None):
+            yield "first"
+            # The next token is a long way off, as during a cold model load. A
+            # real runtime only notices the cancel between tokens, so poll like one.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if cancelled.is_set():
+                    return
+                time.sleep(0.01)
+            yield "second"
+
+    async def scenario():
+        jobs = {"job-1": asyncio.Event()}
+        job = {"id": "job-1", "model": "stub-model", "messages": [{"role": "user", "content": "go"}]}
+        task = asyncio.create_task(agent.run_job(Socket(), job, jobs))
+        while not sent:                        # the first chunk is on the wire
+            await asyncio.sleep(0.005)
+        jobs["job-1"].set()                    # the gateway sent `cancel`
+        started = time.monotonic()
+        await asyncio.wait_for(task, timeout=1.0)
+        return time.monotonic() - started, jobs
+
+    real = agent.RUNTIME
+    agent.RUNTIME = SlowRuntime()
+    try:
+        elapsed, jobs = asyncio.run(scenario())
+    finally:
+        agent.RUNTIME = real
+
+    terminals = [f for f in sent if f["t"] in ("done", "error")]
+    if terminals != [{"t": "error", "id": "job-1", "message": "cancelled"}]:
+        raise AssertionError(f"expected one cancelled terminal, got {sent}")
+    if sent[-1] is not terminals[0]:
+        raise AssertionError(f"frames after the terminal: {sent}")
+    if jobs:
+        raise AssertionError(f"cancelled job still tracked: {jobs}")
+    if elapsed > 0.5:
+        raise AssertionError(f"terminal took {elapsed:.2f}s after cancel; it waited for the runtime")
+
+
+check("a cancelled job ends with one terminal frame, promptly", _cancel_sends_one_terminal_promptly)
+
 if failures:
     print(f"\n{len(failures)} failure(s):")
     for f in failures:
