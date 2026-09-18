@@ -69,6 +69,15 @@ export function normalizeProviderAgent(agent) {
     build = agent.build;
   }
 
+  // Whether the primary model (the first advertised) is resident right now. Agents
+  // that predate the ready bit send nothing, which the gateway keeps as unknown; a
+  // present value must be a real boolean, like every other bounded claim here.
+  let ready = null;
+  if (agent.ready !== undefined && agent.ready !== null) {
+    if (typeof agent.ready !== 'boolean') throw new TypeError('ready must be true or false');
+    ready = agent.ready;
+  }
+
   return {
     id: agent.id,
     models,
@@ -78,5 +87,15 @@ export function normalizeProviderAgent(agent) {
     region: optionalText(agent.region, 'region'),
     runtime: optionalText(agent.runtime, 'runtime'),
     memory_gb: memoryGb,
+    ready,
   };
+}
+
+/**
+ * A provider's `status` frame, sent after hello when residency changes. The only
+ * field is the ready bit; anything else on the frame is dropped.
+ */
+export function normalizeProviderStatus(msg) {
+  if (typeof msg?.ready !== 'boolean') throw new TypeError('status.ready must be true or false');
+  return { ready: msg.ready };
 }

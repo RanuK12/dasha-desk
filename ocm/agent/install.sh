@@ -54,6 +54,10 @@
 #                           may never be root.
 #   OCM_REGION="us-west-2"  what the machine reports as its region. A reinstall keeps
 #                           the value already in /etc/ocm/agent.env; unset means "local".
+#   OCM_PRELOAD=1           load the model when the agent starts, and again whenever it
+#                           stops being resident, so no request pays the cold start.
+#                           Off by default: it holds ~4.5 GB before any work arrives.
+#                           A reinstall keeps the value already in /etc/ocm/agent.env.
 set -eu
 
 # Root must not inherit a caller-controlled PATH while downloading or installing
@@ -243,6 +247,12 @@ if [ -n "$REGION" ]; then
   matches "$REGION" '^[-A-Za-z0-9._]{1,32}$' \
     || die "OCM_REGION contains unsupported characters"
 fi
+# The preload switch follows the same rule: explicit wins, then what is on disk.
+PRELOAD="${OCM_PRELOAD:-$(sed -n 's|^OCM_PRELOAD=||p' /etc/ocm/agent.env 2>/dev/null | head -1)}"
+if [ -n "$PRELOAD" ]; then
+  matches "$PRELOAD" '^[01]$' \
+    || die "OCM_PRELOAD must be 1 (load the model at start) or 0"
+fi
 id "$RUN_USER" >/dev/null 2>&1 || die "OCM_RUN_USER does not name a local account"
 RUN_HOME=$(dscl . -read "/Users/$RUN_USER" NFSHomeDirectory 2>/dev/null \
   | awk '{ print $2; exit }')
@@ -339,6 +349,7 @@ dry run
   credential  $CREDENTIAL
   daemon      $DAEMON
   region      ${REGION:-local}
+  preload     $([ "${PRELOAD:-0}" = 1 ] && echo "on; the model loads when the agent starts" || echo "off; the model loads on the first request (OCM_PRELOAD=1 to change)")
   uv          $UV
   build       $BUILD
   model       $HUB
@@ -422,6 +433,8 @@ OCM_AGENT_ID=$AGENT_ID
 OCM_MODEL_MAP=$MODEL_MAP
 ENV
 [ -z "$REGION" ] || printf 'OCM_REGION=%s\n' "$REGION" >> "$WORK/agent.env"
+# Off unless asked for; the line is written only when set so the file stays minimal.
+[ -z "$PRELOAD" ] || printf 'OCM_PRELOAD=%s\n' "$PRELOAD" >> "$WORK/agent.env"
 put 600 "$RUN_USER" "$WORK/agent.env" /etc/ocm/agent.env
 
 cat > "$WORK/ocm-agent-run" <<RUN

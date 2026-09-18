@@ -12,6 +12,7 @@ connection — that is what makes this installable by a non-technical Mac owner
 expected to drop, and API Gateway caps a connection at two hours regardless.
 
   uv run ocm/agent/agent.py --doctor
+  uv run ocm/agent/agent.py --doctor --load     # also loads the model and times it
   uv run ocm/agent/agent.py --benchmark
   OCM_GATEWAY_URL=ws://127.0.0.1:8080 uv run ocm/agent/agent.py
 """
@@ -38,6 +39,14 @@ HOST_TOKEN = os.getenv("OCM_HOST_TOKEN", "host-dev-token")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 AGENT_ID = os.getenv("OCM_AGENT_ID") or f"{platform.node().split('.')[0]}-{os.getpid()}"
 REGION = os.getenv("OCM_REGION", "local")
+# A host advertises its models at hello long before Metal has loaded anything, so the
+# gateway used to learn that a machine was warm only from its first chunk — and the
+# consumer who triggered that chunk paid the ~75s load. `ready` tells the gateway
+# whether the primary model (the first one advertised) is resident right now.
+# OCM_PRELOAD=1 loads it at start and again whenever it stops being resident, so no
+# request pays the cold start. Off by default in the alpha: a preload holds ~4.5 GB
+# before any work has arrived, on a machine somebody is still using.
+PRELOAD = os.getenv("OCM_PRELOAD", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _self_sha256():
@@ -114,8 +123,12 @@ def _job_max_tokens(job):
     return want or cap
 
 
-def capabilities(models):
-    """The record advertised at handshake (PDF §03 step 4)."""
+def capabilities(models, ready=None):
+    """The record advertised at handshake (PDF §03 step 4).
+
+    `ready` is whether the primary model is resident; None leaves the field out, which
+    is what agents before the ready bit sent and what the gateway reads as unknown.
+    """
     mem = 0
     try:
         mem = round(int(subprocess.run(["sysctl", "-n", "hw.memsize"],
@@ -130,7 +143,7 @@ def capabilities(models):
             chip = out
     except Exception:
         pass
-    return {
+    caps = {
         "id": AGENT_ID,
         "chip": chip,
         "arch": platform.machine(),
@@ -142,6 +155,14 @@ def capabilities(models):
         # thermal_headroom needs `powermetrics` (root) — deliberately omitted rather
         # than faked; the gateway treats it as optional.
     }
+    if ready is not None:
+        caps["ready"] = bool(ready)
+    return caps
+
+
+def status_frame(ready):
+    """What the agent sends when residency changes after hello."""
+    return {"t": "status", "ready": bool(ready)}
 
 
 class OllamaRuntime:
@@ -170,6 +191,25 @@ class OllamaRuntime:
                 if public.strip() == model:
                     return local.strip()
         return model
+
+    def ready(self, model):
+        """Is the model resident in Ollama right now? False when Ollama cannot say."""
+        try:
+            running = _http_json(f"{OLLAMA_URL}/api/ps", timeout=5).get("models", [])
+        except Exception:                    # noqa: BLE001
+            return False
+        local = self.local_name(model)
+        return any(m.get("name") == local or m.get("model") == local for m in running)
+
+    def load(self, model):
+        """Load the model and keep it resident. Blocking.
+
+        A chat with no messages is Ollama's documented way to load without generating;
+        a model that is not pulled is a 404, which raises.
+        """
+        _http_json(f"{OLLAMA_URL}/api/chat",
+                   {"model": self.local_name(model), "messages": [], "stream": False},
+                   timeout=600)
 
     def stream(self, model, messages, cancelled, max_tokens=None):
         """Yield content deltas. Blocking; run in a worker thread."""
@@ -246,6 +286,15 @@ class MlxRuntime:
                 self._model, self._tokenizer = model_obj, tokenizer
                 self._loaded = target
         return self._model, self._tokenizer
+
+    def ready(self, model):
+        """Is this exact model the one held resident right now? Cheap; no IO."""
+        return self._loaded == self._model_id(model)
+
+    def load(self, model):
+        """Load the weights and hold them resident. Blocking; raises when they cannot
+        be loaded, which is the whole point of `--doctor --load`."""
+        self._ensure(model)
 
     @staticmethod
     def _eos_ids(tok):
@@ -385,18 +434,61 @@ async def session():
     models = RUNTIME.models()
     if not models:
         raise RuntimeError("runtime reports no models")
+    primary = models[0]
     url = f"{GATEWAY_URL.rstrip('/')}/host/connect"
+    loop = asyncio.get_running_loop()
+
+    def resident():
+        # Ollama answers this over HTTP; keep it off the event loop.
+        return loop.run_in_executor(None, RUNTIME.ready, primary)
+
+    reported = await resident()
     async with _connect(url) as ws:
-        await ws.send(json.dumps({"t": "hello", "agent": capabilities(models)}))
+        await ws.send(json.dumps({"t": "hello", "agent": capabilities(models, ready=reported)}))
         jobs: dict[str, asyncio.Event] = {}
+
+        async def report_ready():
+            """One small status frame, only when residency actually changed."""
+            nonlocal reported
+            now = await resident()
+            if now != reported:
+                reported = now
+                try:
+                    await ws.send(json.dumps(status_frame(now)))
+                except Exception:            # noqa: BLE001  socket gone; next hello says
+                    pass
+
+        async def preload():
+            if await resident():
+                return
+            print(f"preloading {primary} …", flush=True)
+            started = time.time()
+            try:
+                await loop.run_in_executor(None, RUNTIME.load, primary)
+                print(f"preloaded {primary} in {time.time() - started:.1f}s", flush=True)
+            except Exception as exc:         # noqa: BLE001
+                print(f"preload failed for {primary}: {exc}", file=sys.stderr, flush=True)
+            await report_ready()
+
+        def after_job(_task):
+            # A job may have loaded the primary model, or replaced it with another one.
+            # Say so, and with OCM_PRELOAD bring the primary back once the host is idle.
+            async def settle():
+                await report_ready()
+                if PRELOAD and not jobs and not reported:
+                    await preload()
+            asyncio.create_task(settle())
+
+        if PRELOAD:
+            asyncio.create_task(preload())
         async for raw in ws:
             msg = json.loads(raw)
             if msg.get("t") == "welcome":
-                print(f"connected as {msg['host_id']} · {RUNTIME.name} · {len(models)} model(s)",
-                      flush=True)
+                print(f"connected as {msg['host_id']} · {RUNTIME.name} · {len(models)} model(s)"
+                      f" · {'model loaded' if reported else 'model not loaded'}", flush=True)
             elif msg.get("t") == "job":
                 jobs[msg["id"]] = asyncio.Event()
-                asyncio.create_task(run_job(ws, msg, jobs))
+                asyncio.create_task(run_job(ws, msg, jobs)).add_done_callback(after_job)
             elif msg.get("t") == "cancel":
                 ev = jobs.get(msg.get("id"))
                 if ev:
@@ -434,14 +526,40 @@ async def forever():
             delay = min(delay * 2, MAX_BACKOFF)
 
 
-def doctor():
-    """Exit nonzero when the local chain cannot serve a request."""
+def doctor(load=False):
+    """Exit nonzero when the local chain cannot serve a request.
+
+    Plain `--doctor` is fast and only lists what the runtime says it has; that is what
+    the installer gates on. `--doctor --load` also loads the primary model through the
+    same path a job takes and times it, so missing or broken weights fail here rather
+    than on the first consumer's request.
+    """
     ok = True
+    models = []
     try:
         models = RUNTIME.models()
         print(f"runtime   {RUNTIME.name}: ok ({len(models)} model(s): {', '.join(models[:4])})")
     except Exception as exc:                 # noqa: BLE001
         print(f"runtime   {RUNTIME.name}: FAIL {exc}")
+        ok = False
+    if load and models:
+        model = models[0]
+        print(f"load      {model} … (downloads the weights the first time)", flush=True)
+        started = time.time()
+        try:
+            RUNTIME.load(model)
+            secs = time.time() - started
+            if RUNTIME.ready(model):
+                print(f"load      ok in {secs:.1f}s — resident")
+            else:
+                print(f"load      FAIL after {secs:.1f}s — loaded without error, "
+                      "but the runtime does not report it resident")
+                ok = False
+        except Exception as exc:             # noqa: BLE001
+            print(f"load      FAIL after {time.time() - started:.1f}s: {exc}")
+            ok = False
+    elif load:
+        print("load      skipped — the runtime reported no model to load")
         ok = False
     caps = capabilities([])
     print(f"host      {caps['chip']} · {caps['memory_gb']} GiB · {caps['arch']}")
@@ -471,6 +589,9 @@ def doctor():
         print("          New provider token, then:")
         print("            sudo /opt/ocm/bin/ocm-agent-token")
         ok = False
+    if not load:
+        print("next      --doctor --load  proves the weights actually load and times it "
+              "(slow the first time; downloads ~4.5 GB)")
     return 0 if ok else 1
 
 
@@ -493,10 +614,14 @@ def benchmark():
 def main():
     ap = argparse.ArgumentParser(description="OCM host agent")
     ap.add_argument("--doctor", action="store_true", help="check the local chain and exit")
+    ap.add_argument("--load", action="store_true",
+                    help="with --doctor: load the model through the runtime and time it")
     ap.add_argument("--benchmark", action="store_true", help="measure local throughput and exit")
     a = ap.parse_args()
+    if a.load and not a.doctor:
+        ap.error("--load goes with --doctor")
     if a.doctor:
-        sys.exit(doctor())
+        sys.exit(doctor(load=a.load))
     if a.benchmark:
         sys.exit(benchmark())
     try:

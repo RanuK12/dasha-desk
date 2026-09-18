@@ -20,7 +20,7 @@ import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGui
 import { RateLimiter, clientIp, keyPrefixIdentifier, emailIdentifier } from './ratelimit.mjs';
 import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm, csrfToken, csrfOk } from './session.mjs';
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
-import { normalizeProviderAgent } from './provider.mjs';
+import { normalizeProviderAgent, normalizeProviderStatus } from './provider.mjs';
 import { normalizeChatRequest } from './request.mjs';
 import { QuotaReservations } from './quota.mjs';
 import { AGENT_DIR, installSha256, agentSha256, shortBuild, buildState } from './agentfiles.mjs';
@@ -147,6 +147,13 @@ class Registry {
       // Preserve useful cache evidence across an authenticated reconnect by the same
       // account, but never across an account boundary.
       warm: existing ? new Map(existing.warm) : new Map(),
+      // The host's own word on whether its primary model (the first it advertises)
+      // is resident: true, false, or null from an agent that predates the ready bit.
+      // Unlike `warm`, which is evidence we saw ourselves, this is a claim — it moves
+      // routing preference and the status views, never billing or timeouts. Not
+      // carried across a reconnect: every hello says afresh.
+      ready: caps.ready ?? null,
+      primary: (caps.models || [])[0] || null,
       lastSeen: Date.now(),
       connectedAt: Date.now(),
     };
@@ -168,6 +175,15 @@ class Registry {
   /** Is this host known to have the exact wire model loaded right now? */
   isWarm(host, wireModel) { return (host.warm.get(wireModel) || 0) > Date.now() - WARM_TTL_MS; }
 
+  /** Does the host itself say the wire model is resident? Only its primary model can be. */
+  isReady(host, wireModel) { return host.ready === true && host.primary === wireModel; }
+
+  /**
+   * Warm by our evidence or ready by the host's word: either way the next request
+   * should not pay a model load, so both rank the same for routing.
+   */
+  isHot(host, wireModel) { return this.isWarm(host, wireModel) || this.isReady(host, wireModel); }
+
   /**
    * Choose a host for a model.
    *
@@ -182,9 +198,13 @@ class Registry {
    * the next request goes to a cold host, which warms up and then competes on equal
    * terms. Deep queueing is the last resort rather than the default.
    *
-   *   0  warm, under the cap      — fast, and has room
-   *   1  cold, under the cap      — slow once, then it is warm and useful
-   *   2  saturated                — queue only when there is nowhere better
+   *   0  warm or ready, under the cap — fast, and has room
+   *   1  cold, under the cap          — slow once, then it is warm and useful
+   *   2  saturated                    — queue only when there is nowhere better
+   *
+   * "Ready" is the host's own report that it has the model loaded (a preload, or a
+   * job served before we connected to it), which is what lets a machine that has
+   * never served us skip the cold tier without a consumer paying to prove it.
    */
   pick(model, exclude = new Set()) {
     const fresh = Date.now() - HOST_TIMEOUT_MS;
@@ -193,7 +213,7 @@ class Registry {
     if (!candidates.length) return null;
     const rank = (h) => {
       if (h.inflight.size >= MAX_INFLIGHT_PER_HOST) return 2;
-      return this.isWarm(h, this.wireName(h, model)) ? 0 : 1;
+      return this.isHot(h, this.wireName(h, model)) ? 0 : 1;
     };
     candidates.sort((a, b) => rank(a) - rank(b) || a.inflight.size - b.inflight.size);
     return candidates[0];
@@ -918,8 +938,11 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
             // `unreported` both mean `ocm-agent-update` is due; no account identity.
             build: shortBuild(h.caps.build), build_state: buildState(h.caps.build, served),
             // Public, and carries no account identity: whether this host will answer
-            // in about a second or has to load a model first.
+            // in about a second or has to load a model first. `warm` is what we saw
+            // (a first chunk); `ready` is what the host says (true/false), or null
+            // from an agent that predates the ready bit.
             warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
+            ready: h.ready,
             inflight: h.inflight.size, uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
           })),
           models: registry.models(),
@@ -1361,6 +1384,15 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         return;
       }
       host.lastSeen = Date.now();
+      if (msg.t === 'status') {
+        // Residency changed on the host: it loaded its primary model, or lost it.
+        // A claim, so it moves routing preference and the status views only.
+        let status;
+        try { status = normalizeProviderStatus(msg); }
+        catch { conn.close(1008, 'invalid provider status'); return; }
+        host.ready = status.ready;
+        return;
+      }
       // A frame for a job no longer in `inflight` — cancelled, timed out, or already
       // settled — is dropped here, after counting as liveness. That is what lets a
       // cancel free the slot without waiting for the host, and what makes a late

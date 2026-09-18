@@ -31,6 +31,12 @@ const ago = (d) => {
   return `${Math.floor(s / 86400)}d ago`;
 };
 
+// A host answers in about a second when its model is resident: `warm` is what the
+// gateway saw (a first chunk), `ready` is what the host itself reported (a preload,
+// or a job served before this gateway connected). Absent `ready` is unknown, and an
+// unknown, never-served host renders cold exactly as it did before the ready bit.
+const resident = (h) => !!(h.warm || h.ready);
+
 /**
  * One table, four steps: code issued, enrolled, first connected, first job. Shared by
  * the owner's dashboard and the admin network view (which adds the owner column).
@@ -45,7 +51,7 @@ function earningsSection(earn, machineIds, live) {
   const rows = machineIds.map((id) => {
     const e = earn.hosts[id] || zero;
     const h = live.get(id);
-    return `<tr><td><span class="dot ${h && (h.inflight || h.warm) ? 'on' : 'off'}"></span><code>${esc(id)}</code></td>
+    return `<tr><td><span class="dot ${h && (h.inflight || resident(h)) ? 'on' : 'off'}"></span><code>${esc(id)}</code></td>
     <td>${num(e.today)}</td><td>${num(e.week)}</td><td>${num(e.all)}</td><td>${num(e.requests)}</td>
     <td>${e.last_at ? esc(ago(e.last_at)) : '<span class="muted">never</span>'}</td></tr>`;
   }).join('');
@@ -83,7 +89,7 @@ function funnelTable(rows, { live, firstServed, credited, owner = null }) {
   const body = rows.map((r) => {
     const h = r.agent_id ? live.get(r.agent_id) : null;
     const now = r.pending ? '<span class="muted">waiting for the installer</span>'
-      : h ? `${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Online, cold'}${updateAvailable(h.build_state) ? ' <span class="warn-text">· update available</span>' : ''}`
+      : h ? `${h.inflight ? 'Serving' : resident(h) ? 'Ready' : 'Online, cold'}${updateAvailable(h.build_state) ? ' <span class="warn-text">· update available</span>' : ''}`
       : r.first_connected_at ? `<span class="muted">offline, seen ${esc(ago(r.last_connected_at))}</span>`
       : '<span class="muted">never connected</span>';
     const name = r.agent_id ? `<code>${esc(r.agent_id)}</code>`
@@ -116,8 +122,9 @@ export async function stats(registry, ledger) {
     models: [...h.models],
     inflight: h.inflight.size,
     // Same evidence /v1/network publishes: will this host answer in about a second,
-    // or does it have to load a model first.
+    // or does it have to load a model first. `warm` we saw; `ready` the host said.
     warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
+    ready: h.ready,
     uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
     credited: led.creditedByHost[h.id] || 0,
   }));
@@ -502,17 +509,19 @@ export async function renderStatus({ registry, ledger }) {
     models: [...h.models],
     inflight: h.inflight.size,
     warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
+    ready: h.ready,
     uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
   }));
   // An idle host that has not loaded a model is cold, not warming: nothing is
-  // happening until a request arrives, and then it takes about a minute.
-  const state = (h) => h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Cold';
+  // happening until a request arrives, and then it takes about a minute. A host
+  // that says its model is loaded (a preload) is Ready before it has served anyone.
+  const state = (h) => h.inflight ? 'Serving' : resident(h) ? 'Ready' : 'Cold';
   const models = registry.models();
   const allTime = led.totals.prompt_tokens + led.totals.completion_tokens;
   const todayTokens = today.prompt_tokens + today.completion_tokens;
 
   const hostRows = hosts.map((h) => `<tr>
-    <td><span class="dot ${h.inflight || h.warm ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
+    <td><span class="dot ${h.inflight || resident(h) ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
     <td>${state(h)}</td>
     <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td><td>${esc(h.region)}</td>
     <td>${esc(h.models.join(', ') || '—')}</td>
@@ -533,7 +542,8 @@ export async function renderStatus({ registry, ledger }) {
 <thead><tr><th>Host</th><th>State</th><th>Chip</th><th>Memory</th><th>Region</th><th>Serving</th><th>Connected</th><th>Agent</th></tr></thead>
 <tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected right now.</div>'}</div>
 <p class="cap" style="margin-top:8px">Cold means the machine will load its model on the first request and answer in
-about a minute; Ready and Serving answer in about a second. Agent is the build each machine runs against the
+about a minute; Ready and Serving answer in about a second. A machine is Ready once it has served recently or
+reports its model loaded at start. Agent is the build each machine runs against the
 one this gateway serves${served ? ` (<code>${esc(shortBuild(served))}</code>)` : ''}; a machine that is behind still serves, and its owner updates it with one command.</p>
 
 <h2>Models</h2>
@@ -587,7 +597,7 @@ export async function renderNetwork({ registry, ledger, accounts, account, csrf 
   const hostRows = hosts.rows.map((h) => `<tr>
     <td><span class="dot ${h.inflight ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
     <td>${who(h.accountId)}</td>
-    <td>${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Cold'}</td>
+    <td>${h.inflight ? 'Serving' : resident(h) ? 'Ready' : 'Cold'}</td>
     <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td>
     <td>${esc(h.models.join(', ') || '—')}</td><td>${h.inflight}</td>
     <td>${dur(h.uptime_s)}</td><td>${num(h.credited)}</td><td>${buildCell(h)}</td></tr>`).join('');
@@ -718,7 +728,10 @@ export function renderProviderGuide({ account = null, apiHost, models, admin = f
   <p class="cap">Expect <code>token ok</code>. Your Mac then appears on the
   <a href="/">console</a> under <strong>Your providers</strong>.</p>
   <div class="note">The first request your machine serves takes <strong>up to about 90
-  seconds</strong> while the model loads. Everything after that takes about a second.</div>
+  seconds</strong> while the model loads. Everything after that takes about a second.
+  To load it at start instead, add <code>OCM_PRELOAD=1</code> to <code>/etc/ocm/agent.env</code>
+  and run <code>sudo launchctl kickstart -k system/com.ocm.agent</code>; the model then holds
+  about 4.5 GB from boot, so this is off by default.</div>
 </div>
 
 <h2>Changing the token later</h2>

@@ -133,6 +133,128 @@ def _cancel_sends_one_terminal_promptly():
 
 check("a cancelled job ends with one terminal frame, promptly", _cancel_sends_one_terminal_promptly)
 
+
+# --- ready bit (P2-13) ---------------------------------------------------------
+# An agent that predates the bit sent no `ready`; the gateway reads absence as unknown.
+# So the field must be absent unless the runtime was actually asked, and a boolean when
+# it was. The status frame is what follows hello when residency changes.
+def _ready_in_hello():
+    assert "ready" not in agent.capabilities([]), "ready must be omitted when unknown"
+    assert agent.capabilities(["m"], ready=True)["ready"] is True
+    assert agent.capabilities(["m"], ready=False)["ready"] is False
+    assert agent.status_frame(True) == {"t": "status", "ready": True}
+    assert agent.status_frame(0) == {"t": "status", "ready": False}
+
+
+check("hello carries ready only when known, and the status frame is {t, ready}", _ready_in_hello)
+
+
+# --- --doctor --load (P2-6) ----------------------------------------------------
+# The MLX load path, without Metal: a stub `mlx_lm` module records what `load` was
+# asked for. This proves MlxRuntime.load reaches mlx_lm.load with the MAPPED id and
+# that ready() flips only once the weights are held.
+def _mlx_load_path():
+    import types
+    asked = []
+    fake = types.ModuleType("mlx_lm")
+    fake.load = lambda name: (asked.append(name), (object(), object()))[1]
+    saved_mod = sys.modules.get("mlx_lm")
+    saved_map = os.environ.get("OCM_MODEL_MAP")
+    sys.modules["mlx_lm"] = fake
+    os.environ["OCM_MODEL_MAP"] = "ocm-coder=mlx-community/fake-4bit"
+    try:
+        rt = agent.MlxRuntime()
+        assert rt.ready("ocm-coder") is False, "nothing is resident before load"
+        rt.load("ocm-coder")
+        assert asked == ["mlx-community/fake-4bit"], asked
+        assert rt.ready("ocm-coder") is True, "resident after load"
+        rt.load("ocm-coder")
+        assert asked == ["mlx-community/fake-4bit"], "a second load is a no-op: held resident"
+    finally:
+        if saved_mod is None:
+            sys.modules.pop("mlx_lm", None)
+        else:
+            sys.modules["mlx_lm"] = saved_mod
+        if saved_map is None:
+            os.environ.pop("OCM_MODEL_MAP", None)
+        else:
+            os.environ["OCM_MODEL_MAP"] = saved_map
+
+
+check("MlxRuntime.load reaches mlx_lm.load with the mapped id and then reports ready", _mlx_load_path)
+
+
+class _FakeRuntime:
+    """Stands in for RUNTIME so the doctor runs end to end without a model or a gateway."""
+    name = "fake"
+
+    def __init__(self, fail=None):
+        self.fail = fail
+        self.loads = 0
+        self._resident = False
+
+    def models(self):
+        return ["ocm-coder"]
+
+    def ready(self, model):
+        return self._resident
+
+    def load(self, model):
+        self.loads += 1
+        if self.fail:
+            raise self.fail
+        self._resident = True
+
+
+def _run_doctor(runtime, load):
+    import contextlib
+    import io
+    saved = (agent.RUNTIME, agent.verify_token, agent.urllib.request.urlopen)
+
+    def _no_network(*args, **kwargs):
+        raise OSError("the smoke test has no gateway")
+
+    agent.RUNTIME = runtime
+    agent.verify_token = lambda timeout=15: (True, "mocked")
+    agent.urllib.request.urlopen = _no_network
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            code = agent.doctor(load=load)
+    finally:
+        agent.RUNTIME, agent.verify_token, agent.urllib.request.urlopen = saved
+    return code, out.getvalue()
+
+
+def _doctor_plain_never_loads():
+    rt = _FakeRuntime()
+    code, out = _run_doctor(rt, load=False)
+    assert code == 0, out
+    assert rt.loads == 0, "plain --doctor must stay fast: it lists, it does not load"
+    assert "--doctor --load" in out, "the doctor names --load as the next step:\n" + out
+
+
+def _doctor_load_times_the_load():
+    import re
+    rt = _FakeRuntime()
+    code, out = _run_doctor(rt, load=True)
+    assert code == 0, out
+    assert rt.loads == 1, "--load loads exactly once"
+    assert re.search(r"^load\s+ok in \d+\.\ds", out, re.M), out
+    assert "--doctor --load" not in out, "no 'next step' hint once the step was taken"
+
+
+def _doctor_load_fails_when_weights_are_missing():
+    rt = _FakeRuntime(fail=FileNotFoundError("mlx-community/fake-4bit: weights not found"))
+    code, out = _run_doctor(rt, load=True)
+    assert code == 1, "a load that throws must fail the doctor:\n" + out
+    assert "load      FAIL" in out and "weights not found" in out, out
+
+
+check("plain --doctor never loads and points at --load", _doctor_plain_never_loads)
+check("--doctor --load loads once, reports the time, exits 0", _doctor_load_times_the_load)
+check("--doctor --load exits 1 when the weights cannot load", _doctor_load_fails_when_weights_are_missing)
+
 if failures:
     print(f"\n{len(failures)} failure(s):")
     for f in failures:
