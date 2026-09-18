@@ -47,6 +47,10 @@ dasha-compute restart
 dasha-compute uninstall
 ```
 
+**Serve more models:** [Add a model](ADD-A-MODEL.md) — the `DASHA_MODEL_MAP`
+walkthrough: picking the Ollama tag, memory tiers, doctor + benchmark
+verification, and how to propose a new public id to the shared catalog.
+
 ## 3. Run the local coordinator
 
 Local-only. The bundled coordinator binds to `127.0.0.1` by default. Default keys are not for the internet. Never expose them. Put the process behind a real HTTPS reverse proxy before any remote test.
