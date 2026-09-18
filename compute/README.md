@@ -105,6 +105,10 @@ The coordinator exposes a dedicated lane for the OpenRouter provider listing so 
 
 This lane is a reference implementation for the live `lobby.getdasha.com` gateway: it is not deployed and does not go live by merging.
 
+### Gateway-side metering alignment
+
+The kit bills on provider-reported usage today (`usage_from()` in `provider/agent.py` reads Ollama's self-reported counts; `finalUsage()` in `coordinator/server.mjs` prefers them). [Gateway-side metering alignment](docs/gateway-metering-alignment.md) maps those fields onto the ocm-telemetry verified-billing program — real tokenizer, gateway-measured tokens, cost-telemetry hook, and a phased shadow → discrepancy-review → verified-billing cutover — using shared terminology, the shared per-model tolerance bands, and the shared evidence-package format. No code or provider-term changes; the meter lands in Phase 1 behind John's tap.
+
 ## Verify or build the source archive
 
 The repository builds the download from an explicit source allowlist. Every archive

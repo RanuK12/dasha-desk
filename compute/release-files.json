@@ -16,6 +16,7 @@
   "console/app/v1/providers/poll/route.ts",
   "console/public/favicon.svg",
   "coordinator/server.mjs",
+  "docs/gateway-metering-alignment.md",
   "examples/chat.py",
   "index.html",
   "install.sh",
