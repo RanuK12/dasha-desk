@@ -90,6 +90,8 @@ python3 provider/agent.py --doctor
 ```
 
 The doctor exits nonzero when the coordinator, Ollama, or any configured model is unavailable.
+Planned checks not yet implemented are specced in [DOCTOR-GAP-SPEC.md](DOCTOR-GAP-SPEC.md),
+and the provider-onboarding analytics contract in [ONBOARDING-FUNNEL-EVENTS.md](ONBOARDING-FUNNEL-EVENTS.md).
 
 Measure actual model throughput with `python3 provider/agent.py --benchmark`. Set `DASHA_BENCHMARK_TOKENS` between 16 and 256 to trade speed for a longer calibrated run.
 
