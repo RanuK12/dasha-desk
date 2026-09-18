@@ -48,7 +48,10 @@ const linkIn = (mail) => (mail.text.match(/https:\/\/console\.test\/recover\/con
 
 test('the request form is not an oracle, the link is single-use, and existing keys survive', async () => {
   const mailer = stubMailer();
-  const gw = await startGateway({ recoveryEnabled: true, mailer });
+  // This test asks for one address five times to prove the outstanding-links cap,
+  // which the per-email rate limit would refuse first. The limit has its own suite
+  // (rate-limit.test.mjs); here it is off so the cap underneath it is what is tested.
+  const gw = await startGateway({ recoveryEnabled: true, mailer, rateLimiter: null });
   try {
     const account = await gw.accounts.createAccount('owner@example.test');
     const oldKey = await gw.accounts.issue(account.id, 'developer_key', 'laptop');

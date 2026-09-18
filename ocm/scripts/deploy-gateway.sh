@@ -49,8 +49,12 @@ ADMINS=\$(aws ssm get-parameter --name /ocm/gateway/admin_emails --query Paramet
 # Account recovery by email ships dark. The switch is an SSM String (0/1), read at every
 # deploy, so turning it on when Amazon grants production sending is a parameter change.
 REC=\$(aws ssm get-parameter --name /ocm/gateway/recovery_enabled --query Parameter.Value --output text --region us-west-2 2>/dev/null || echo 0)
-sed -i '/^OCM_INVITE_CODE=/d;/^OCM_SESSION_SECRET=/d;/^OCM_ADMIN_EMAILS=/d;/^OCM_RECOVERY_ENABLED=/d' /etc/ocm/gateway.env
+sed -i '/^OCM_INVITE_CODE=/d;/^OCM_SESSION_SECRET=/d;/^OCM_ADMIN_EMAILS=/d;/^OCM_RECOVERY_ENABLED=/d;/^OCM_TRUST_PROXY=/d' /etc/ocm/gateway.env
 [ "\$REC" = 1 ] && printf 'OCM_RECOVERY_ENABLED=1\n' >> /etc/ocm/gateway.env
+# The gateway sits behind exactly one proxy (the ALB), which appends the address it
+# saw to X-Forwarded-For. The rate limiter keys on that entry; with this unset it
+# would key on the ALB's own address and throttle every visitor as one.
+printf 'OCM_TRUST_PROXY=1\n' >> /etc/ocm/gateway.env
 printf 'OCM_INVITE_CODE=%s\n' "\$INV" >> /etc/ocm/gateway.env
 if [ -n "\$ADMINS" ] && [ "\$ADMINS" != "None" ]; then printf 'OCM_ADMIN_EMAILS=%s\n' "\$ADMINS" >> /etc/ocm/gateway.env; fi
 printf 'OCM_SESSION_SECRET=%s\n' "\$SES" >> /etc/ocm/gateway.env

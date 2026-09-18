@@ -16,7 +16,8 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
 import { createMailer, recoveryMessage, maskEmail } from './mail.mjs';
-import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderDeveloperGuide, renderProfile, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderEnrollment, renderStatus } from './console.mjs';
+import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderDeveloperGuide, renderProfile, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderRateLimited, renderEnrollment, renderStatus } from './console.mjs';
+import { RateLimiter, clientIp, keyPrefixIdentifier, emailIdentifier } from './ratelimit.mjs';
 import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
@@ -229,6 +230,21 @@ const html = (res, code, body) => {
 
 const redirect = (res, location) => { res.writeHead(302, { location }); res.end(); };
 
+/**
+ * 429 for a throttled credential route. One sentence, the same for every caller:
+ * the refusal says nothing about whether the key, code or address it was sent
+ * with is real. `Retry-After` is whole seconds, as the header requires.
+ */
+const rateLimited = (res, retryAfter, { asHtml = false } = {}) => {
+  res.setHeader('retry-after', String(retryAfter));
+  if (asHtml) return html(res, 429, renderRateLimited({ retryAfter }));
+  return json(res, 429, { error: {
+    type: 'rate_limited',
+    message: `too many requests; try again in ${retryAfter}s`,
+    retry_after: retryAfter,
+  } });
+};
+
 const readBody = (req, limit = 2 * 1024 * 1024) => new Promise((resolve, reject) => {
   let size = 0; const parts = [];
   req.on('data', (c) => {
@@ -278,7 +294,19 @@ export async function createGateway({
   recoveryEnabled = process.env.OCM_RECOVERY_ENABLED === '1',
   // Tests inject a stub; production builds the SES client on first send.
   mailer = null,
+  // Throttle on the four routes that accept a request with no credential and may
+  // hand one back (review P1-4). The default is the alpha table in ratelimit.mjs;
+  // tests that legitimately hammer those routes pass `null` to switch it off, or a
+  // RateLimiter with a fake clock to prove it.
+  rateLimiter = new RateLimiter(),
+  // How many proxies in front of this process append to X-Forwarded-For. 0 keys the
+  // limiter on the socket peer, which behind the ALB would be the ALB itself and
+  // would throttle everyone together; production sets 1. See clientIp().
+  trustProxy = Number(process.env.OCM_TRUST_PROXY || 0),
 } = {}) {
+  const limiter = rateLimiter || null;
+  // One request against every (rule, key) it names; `ok` when none refused.
+  const throttle = (pairs) => (limiter ? limiter.hitAll(pairs) : { ok: true });
   const mail = mailer || (recoveryEnabled ? createMailer() : null);
   // Constant-time, like every other credential check here (review P2-3).
   const adminOk = (given) => {
@@ -462,6 +490,9 @@ export async function createGateway({
 
         if (req.method === 'POST' && consolePath === '/signup') {
           const f = parseForm(await readBody(req));
+          // Before any lookup, so the refusal carries no information about the address.
+          const rl = throttle([['signup_ip', clientIp(req, trustProxy)]]);
+          if (!rl.ok) return rateLimited(res, rl.retryAfter, { asHtml: true });
           if (!f.email) return redirect(res, '/?error=' + encodeURIComponent('An email address is required.'));
           // Signup must NEVER authenticate an existing email. Accounts are keyed by
           // email, so without this an unauthenticated visitor who types someone
@@ -528,6 +559,11 @@ needs no invite code: your machine earns credits as it serves. See
         }
         if (req.method === 'POST' && consolePath === '/recover') {
           const f = parseForm(await readBody(req));
+          // Per address and per submitted email, counted before the account lookup and
+          // whether or not the address has an account, so a 429 is not an oracle.
+          const rl = throttle([['recover_ip', clientIp(req, trustProxy)],
+                               ['recover_email', emailIdentifier(f.email)]]);
+          if (!rl.ok) return rateLimited(res, rl.retryAfter, { asHtml: true });
           let email = null;
           try { email = normalizeEmail(f.email); } catch { email = null; }
           const acct = email ? await accounts.accountByEmail(email) : null;
@@ -571,6 +607,12 @@ You are signed in with this one.</p>`,
 
         if (req.method === 'POST' && consolePath === '/signin') {
           const f = parseForm(await readBody(req));
+          // Per address and per key prefix, before the lookup: a guess spread across
+          // many addresses still shares one bucket per target, and the 429 is the
+          // same whether or not the key is real.
+          const rl = throttle([['signin_ip', clientIp(req, trustProxy)],
+                               ['signin_key', keyPrefixIdentifier(f.key)]]);
+          if (!rl.ok) return rateLimited(res, rl.retryAfter, { asHtml: true });
           const found = await accounts.resolve(f.key, 'developer_key');
           if (!found) return redirect(res, '/?error=' + encodeURIComponent('That key is not valid, or has been revoked.'));
           res.setHeader('set-cookie',
@@ -790,8 +832,13 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
       // used and expired are one answer on purpose (no oracle). The token appears in
       // this response and nowhere else, ever.
       if (req.method === 'POST' && url.pathname === '/v1/provider/enroll') {
+        const raw = await readBody(req);
+        // Per address, before the code is even parsed: the JSON error would
+        // otherwise be a free request.
+        const rl = throttle([['enroll_ip', clientIp(req, trustProxy)]]);
+        if (!rl.ok) return rateLimited(res, rl.retryAfter);
         let body;
-        try { body = JSON.parse(await readBody(req) || '{}'); }
+        try { body = JSON.parse(raw || '{}'); }
         catch { return apiError(res, 400, 'body must be JSON'); }
         const code = typeof body.code === 'string' ? body.code : '';
         const agentId = typeof body.agent_id === 'string' ? body.agent_id : '';

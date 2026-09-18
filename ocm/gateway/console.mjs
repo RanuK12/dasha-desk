@@ -297,6 +297,18 @@ longer hold from the console afterwards.</p>
 in 30 minutes; nothing has changed.</p>`);
 }
 
+/**
+ * 429 for a throttled console form. Deliberately says nothing about the key, code or
+ * address that was submitted: the same page for a stranger guessing and for a person
+ * who mistyped, so it cannot become an oracle.
+ */
+export function renderRateLimited({ retryAfter }) {
+  const secs = Math.max(1, Math.floor(Number(retryAfter) || 1));
+  return page('Too many requests', `<h1>Too many requests</h1>
+<p class="sub">Please wait ${secs} second${secs === 1 ? '' : 's'} and try again.
+<a href="/">Back to the console</a>.</p>`);
+}
+
 export function renderRecoverInvalid() {
   return page('Recovery link not valid', `<h1>That link is not valid</h1>
 <p class="sub">It may have been used already, or it has expired. Links work once and last 30
