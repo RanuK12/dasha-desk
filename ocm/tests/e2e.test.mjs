@@ -917,7 +917,7 @@ test('a freshly installed MLX provider advertises the name consumers request', (
   assert.match(src, /^OCM_MODEL_MAP=\$MODEL_MAP$/m,
     'the map must be written into agent.env');
   // Between the heredoc opener and its closing delimiter (a line that is just ENV).
-  const openAt = src.indexOf('cat > /etc/ocm/agent.env <<ENV');
+  const openAt = src.indexOf('cat > "$WORK/agent.env" <<ENV');
   const body = src.slice(openAt, src.indexOf('\nENV\n', openAt));
   assert.match(body, /OCM_MODEL_MAP=\$MODEL_MAP/,
     'the map must be written inside the agent.env heredoc');
@@ -1035,13 +1035,13 @@ test('the installer generates a run wrapper that forwards its arguments', () => 
   // as well is the other wrong answer: it passes a literal `"--doctor"`, quotes and
   // all. So generate the file for real and run it, rather than grepping for a shape.
   const src = readFileSync(new URL('../agent/install.sh', import.meta.url), 'utf8');
-  const open = 'cat > "$PREFIX/bin/ocm-agent-run" <<RUN';
+  const open = 'cat > "$WORK/ocm-agent-run" <<RUN';
   const start = src.indexOf(open);
   assert.ok(start > 0, 'the wrapper heredoc must exist');
   const block = src.slice(start, src.indexOf('\nRUN\n', start) + 5);
 
   const dir = mkdtempSync(join(tmpdir(), 'ocm-wrap-'));
-  execFileSync('sh', ['-c', `PREFIX=${dir}; UV=/bin/echo; mkdir -p $PREFIX/bin; ${block}`]);
+  execFileSync('sh', ['-c', `PREFIX=${dir}; WORK=${dir}/bin; UV=/bin/echo; mkdir -p $PREFIX/bin; ${block}`]);
   const wrapper = readFileSync(join(dir, 'bin', 'ocm-agent-run'), 'utf8');
   assert.match(wrapper, /agent\.py "\$@"\s*$/,
     'the wrapper must forward "$@" literally');
@@ -1058,15 +1058,16 @@ test('the installer generates a run wrapper that forwards its arguments', () => 
   assert.doesNotMatch(run(''), /agent\.py \S/,
     'no arguments must mean no arguments');
 
-  // `umask 077` is set earlier for the token file and stays in effect, so a bare
-  // `chmod +x` leaves these helpers root-only. Neither holds a secret, and 700 blocks
-  // the owner from reading back what was installed — the verification we ask for.
-  assert.match(src, /chmod 755 "\$PREFIX\/bin\/ocm-agent-run"/,
+  // `umask 077` is set earlier for the token file and stays in effect, so a file
+  // published without an explicit mode would be root-only. Neither helper holds a
+  // secret, and 700 blocks the owner from reading back what was installed — the
+  // verification we ask for. put() sets the mode before the rename makes it visible.
+  assert.match(src, /put 755 root "\$WORK\/ocm-agent-run" "\$PREFIX\/bin\/ocm-agent-run"/,
     'the run wrapper must be readable, not 700');
-  assert.match(src, /chmod 755 "\$PREFIX\/bin\/ocm-agent-token"/,
+  assert.match(src, /put 755 root "\$WORK\/ocm-agent-token" "\$PREFIX\/bin\/ocm-agent-token"/,
     'the rotation helper must be readable too');
-  assert.match(src, /chmod 600 \/etc\/ocm\/agent\.env/,
-    'the token file itself must stay root-only');
+  assert.match(src, /put 600 "\$RUN_USER" "\$WORK\/agent\.env" \/etc\/ocm\/agent\.env/,
+    'the token file itself must stay owner-only');
 });
 
 test('the installer hash is published and matches the bytes served', async () => {

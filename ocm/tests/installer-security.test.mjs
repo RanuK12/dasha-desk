@@ -55,7 +55,7 @@ test('every shell-sourced provider value is constrained before agent.env is writ
   }
 
   const validation = source.indexOf('matches "$GATEWAY"');
-  const envWrite = source.indexOf('cat > /etc/ocm/agent.env');
+  const envWrite = source.indexOf('cat > "$WORK/agent.env"');
   assert.ok(validation > 0 && validation < envWrite,
     'validation must happen before the provider environment file is written');
 });
@@ -93,11 +93,11 @@ test('the inference daemon is explicitly forbidden from running as root', () => 
 });
 
 test('provider secrets and logs are owned only by the unprivileged runtime account', () => {
-  const envWrite = source.indexOf('cat > /etc/ocm/agent.env');
-  const launchd = source.indexOf('cat > /Library/LaunchDaemons/com.ocm.agent.plist');
+  const envWrite = source.indexOf('cat > "$WORK/agent.env"');
+  const launchd = source.indexOf('cat > "$WORK/com.ocm.agent.plist"');
   const section = source.slice(envWrite, launchd);
-  assert.match(section, /chown "\$RUN_USER" \/etc\/ocm\/agent\.env/);
-  assert.match(section, /chmod 600 \/etc\/ocm\/agent\.env/);
+  // Mode and owner are set on the staged copy and published by one rename (put).
+  assert.match(section, /put 600 "\$RUN_USER" "\$WORK\/agent\.env" \/etc\/ocm\/agent\.env/);
   assert.match(section, /touch \/var\/log\/ocm-agent\.log/);
   assert.match(section, /chown "\$RUN_USER" \/var\/log\/ocm-agent\.log/);
   assert.match(section, /chmod 600 \/var\/log\/ocm-agent\.log/);
@@ -125,21 +125,21 @@ test('the doctor runs from a directory the runtime account can enter', () => {
 test('the downloaded agent is proved before a working installation is replaced', () => {
   const download = source.indexOf('curl_https --fail "$SOURCE/agent.py"');
   const doctor = source.indexOf('"$UV" run --quiet --python 3.12 "$TMP_AGENT" --doctor');
-  const install = source.indexOf('install -m 755 "$TMP_AGENT" "$PREFIX/agent/agent.py"');
+  const install = source.indexOf('put 755 root "$TMP_AGENT" "$PREFIX/agent/agent.py"');
   assert.ok(download > 0 && doctor > download && install > doctor,
     'download -> unprivileged doctor -> install must be the only allowed order');
   assert.match(source, /no installed files were changed/);
 });
 
 test('token rotation validates credential, gateway and runtime owner', () => {
-  const rotation = source.slice(source.indexOf("cat > \"$PREFIX/bin/ocm-agent-token\""));
+  const rotation = source.slice(source.indexOf("cat > \"$WORK/ocm-agent-token\""));
   assert.match(rotation, /expected an issued ocm_host_ provider token/);
   assert.match(rotation, /unsafe or missing gateway URL/);
   assert.match(rotation, /could not identify the provider account/);
   assert.match(rotation, /provider environment may not be owned by root/);
   assert.match(rotation, /nothing was changed/);
-  assert.match(rotation, /chown "\$OWNER" \/etc\/ocm\/agent\.env/);
-  assert.match(rotation, /mktemp "\$\{TMPDIR:-\/tmp\}\/ocm-token\.XXXXXX"/);
+  assert.match(rotation, /chown "\$OWNER" "\$TMP"/);
+  assert.match(rotation, /mktemp "\$ENV\.XXXXXX"/);
   assert.match(rotation, /do not pass the token on the command line/);
   assert.match(rotation, /OCM_HOST_TOKEN_FILE/);
   assert.match(rotation, /stty -echo/);
@@ -200,7 +200,7 @@ test('the installer never logs the provider token', () => {
 });
 
 test('the update helper reinstalls from what is on disk and never exposes the token', () => {
-  const start = source.indexOf("cat > \"$PREFIX/bin/ocm-agent-update\" <<'UPD'");
+  const start = source.indexOf("cat > \"$WORK/ocm-agent-update\" <<'UPD'");
   assert.ok(start > 0, 'install.sh must install ocm-agent-update');
   const end = source.indexOf('\nUPD\n', start);
   assert.ok(end > start);
@@ -227,8 +227,8 @@ test('the update helper reinstalls from what is on disk and never exposes the to
   const check = spawnSync('sh', ['-n'], { input: helper, encoding: 'utf8' });
   assert.equal(check.status, 0, check.stderr);
   // It is installed executable, after the rotation helper and before launchd is touched.
-  const chmod = source.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-update"');
-  const token = source.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-token"');
+  const chmod = source.indexOf('put 755 root "$WORK/ocm-agent-update" "$PREFIX/bin/ocm-agent-update"');
+  const token = source.indexOf('put 755 root "$WORK/ocm-agent-token" "$PREFIX/bin/ocm-agent-token"');
   const bootout = source.indexOf('launchctl bootout system/com.ocm.agent 2>/dev/null || true');
   assert.ok(token < start && chmod > end && chmod < bootout);
   // And it is documented where a provider will look.
@@ -277,7 +277,7 @@ test('an enrollment code is exchanged for a bound token, in a body, before anyth
 });
 
 test('the rotation helper accepts an enrollment code and exchanges it the same way', () => {
-  const start = source.indexOf("cat > \"$PREFIX/bin/ocm-agent-token\" <<'TOK'");
+  const start = source.indexOf("cat > \"$WORK/ocm-agent-token\" <<'TOK'");
   const end = source.indexOf('\nTOK\n', start);
   assert.ok(start > 0 && end > start);
   const helper = source.slice(source.indexOf('\n', start) + 1, end + 1);
@@ -286,7 +286,7 @@ test('the rotation helper accepts an enrollment code and exchanges it the same w
   const verify = helper.indexOf('"$BASE/v1/provider/verify"');
   assert.ok(exchange > 0 && shape > exchange && verify > shape,
     'code exchange -> token-shape check -> verify, so a bad exchange never reaches the env file');
-  assert.match(helper, /AGENT_ID=\$\(sed -n 's\|\^OCM_AGENT_ID=\|\|p' \/etc\/ocm\/agent\.env\)/,
+  assert.match(helper, /AGENT_ID=\$\(sed -n 's\|\^OCM_AGENT_ID=\|\|p' "\$ENV"\)/,
     'the helper enrolls under the id already recorded on this machine');
   assert.match(helper, /printf '%s' "\$ENROLL_BODY" \| curl/, 'the rotation helper also feeds the code on stdin');
   assert.match(helper, /--data @-/);
@@ -304,10 +304,10 @@ test('a reinstall keeps the region the machine already reports', () => {
   assert.match(source, /REGION="\$\{OCM_REGION:-\$\(sed -n 's\|\^OCM_REGION=\|\|p' \/etc\/ocm\/agent\.env 2>\/dev\/null \| head -1\)\}"/,
     'explicit OCM_REGION wins, then the existing env file, then unset');
   assert.match(source, /matches "\$REGION" '\^\[-A-Za-z0-9\._\]\{1,32\}\$'/, 'the region is allowlisted before it is written to a sourced file');
-  const write = source.indexOf("printf 'OCM_REGION=%s\\n' \"$REGION\" >> /etc/ocm/agent.env");
-  const env = source.indexOf('cat > /etc/ocm/agent.env <<ENV');
-  const chown = source.indexOf('chown "$RUN_USER" /etc/ocm/agent.env');
-  assert.ok(env > 0 && write > env && write < chown, 'the region line is appended right after the env file is written, before ownership is set');
+  const write = source.indexOf("printf 'OCM_REGION=%s\\n' \"$REGION\" >> \"$WORK/agent.env\"");
+  const env = source.indexOf('cat > "$WORK/agent.env" <<ENV');
+  const publish = source.indexOf('put 600 "$RUN_USER" "$WORK/agent.env" /etc/ocm/agent.env');
+  assert.ok(env > 0 && write > env && write < publish, 'the region line is appended to the staged env file before it is published');
 });
 
 test('--dry-run runs every check, spends no enrollment code, and exits before anything is written', () => {
@@ -322,17 +322,21 @@ test('--dry-run runs every check, spends no enrollment code, and exits before an
   assert.ok(verify > 0 && verify < stop, 'the token is still checked against the gateway before the dry run stops');
   // Every write-shaped step comes after the stop: nothing before it touches the disk.
   for (const write of [
+    'mktemp -d "${TMPDIR:-/tmp}/ocm-install.XXXXXX"',
     'curl_https --fail "$SOURCE/agent.py"',
+    'curl_https --fail "$SOURCE/agent.py.sha256" -o',
     'mkdir -p "$PREFIX/agent" "$PREFIX/bin"',
-    'install -m 755 "$TMP_AGENT"',
+    'put 755 root "$TMP_AGENT"',
     'install -d -m 700 /etc/ocm',
-    'cat > /etc/ocm/agent.env',
-    'cat > "$PREFIX/bin/ocm-agent-run"',
-    'cat > "$PREFIX/bin/ocm-agent-token"',
-    'cat > "$PREFIX/bin/ocm-agent-update"',
-    'cat > "$PREFIX/bin/ocm-agent-uninstall"',
+    'cat > "$WORK/agent.env"',
+    'put 600 "$RUN_USER" "$WORK/agent.env" /etc/ocm/agent.env',
+    'cat > "$WORK/ocm-agent-run"',
+    'cat > "$WORK/ocm-agent-token"',
+    'cat > "$WORK/ocm-agent-update"',
+    'cat > "$WORK/ocm-agent-uninstall"',
     'touch /var/log/ocm-agent.log',
-    'cat > /Library/LaunchDaemons/com.ocm.agent.plist',
+    'cat > "$WORK/com.ocm.agent.plist"',
+    'put 644 root "$WORK/com.ocm.agent.plist" /Library/LaunchDaemons/com.ocm.agent.plist',
     'launchctl bootout system/com.ocm.agent 2>/dev/null || true',
     'launchctl bootstrap system',
   ]) {
@@ -372,7 +376,7 @@ test('--dry-run runs every check, spends no enrollment code, and exits before an
 });
 
 test('the uninstaller removes exactly what the installer wrote and can preview that', () => {
-  const start = source.indexOf("cat > \"$PREFIX/bin/ocm-agent-uninstall\" <<'UNINST'");
+  const start = source.indexOf("cat > \"$WORK/ocm-agent-uninstall\" <<'UNINST'");
   assert.ok(start > 0, 'install.sh must install ocm-agent-uninstall');
   const end = source.indexOf('\nUNINST\n', start);
   assert.ok(end > start);
@@ -424,8 +428,8 @@ test('the uninstaller removes exactly what the installer wrote and can preview t
   assert.match(helper, /not revoked/);
   // Installed executable after the update helper and before launchd is touched; the
   // printed rm -rf is gone from the closing instructions and the guide documents it.
-  const chmod = source.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-uninstall"');
-  const update = source.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-update"');
+  const chmod = source.indexOf('put 755 root "$WORK/ocm-agent-uninstall" "$PREFIX/bin/ocm-agent-uninstall"');
+  const update = source.indexOf('put 755 root "$WORK/ocm-agent-update" "$PREFIX/bin/ocm-agent-update"');
   // The uninstaller carries its own bootout line; the installer's is the last one.
   const bootout = source.lastIndexOf('launchctl bootout system/com.ocm.agent 2>/dev/null || true');
   assert.ok(update < start && chmod > end && chmod < bootout);

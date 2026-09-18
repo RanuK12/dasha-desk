@@ -14,8 +14,10 @@
 # What it does:
 #   1. refuses to run on anything but Apple Silicon macOS
 #   2. requires an existing, explicitly located uv binary
-#   3. downloads the agent over HTTPS and proves its doctor path before replacing files
-#   4. stores your provider token in an owner-only environment file
+#   3. downloads the agent over HTTPS, checks it against the checksum the gateway
+#      publishes, and proves its doctor path before replacing files
+#   4. stores your provider token in an owner-only environment file; every file it
+#      installs is written beside its destination and renamed into place
 #   5. installs a launchd daemon that runs as the invoking non-root user
 #   6. installs ocm-agent-token, ocm-agent-update and ocm-agent-uninstall beside it
 #
@@ -104,6 +106,28 @@ curl_https() {
   curl --silent --show-error --location \
     --proto '=https' --proto-redir '=https' --tlsv1.2 "$@"
 }
+# The token reaches curl as one config line on stdin (-K -), never as an argument:
+# -H "Authorization: Bearer …" is argv, readable by every local process for the life
+# of the request. printf is a builtin, so the value is never an argument to any
+# process, and nothing is written to disk.
+curl_bearer() {
+  printf 'header = "Authorization: Bearer %s"\n' "$OCM_HOST_TOKEN" | curl_https -K - "$@"
+}
+# --- put (begin)
+# Every file this script installs is copied to a sibling of its destination, given its
+# final mode and owner there, and renamed into place. A failure mid-write then leaves
+# the previous file whole instead of truncated, and nothing appears under the final
+# name before it is complete. The sibling, not $TMPDIR, is what makes the rename
+# atomic rather than a copy across filesystems.
+PUT_TMP=""
+put() {  # put MODE OWNER SOURCE DEST
+  PUT_TMP=$(mktemp "$4.XXXXXX") || die "could not create a temporary file beside $4"
+  cp "$3" "$PUT_TMP" && chown "$2" "$PUT_TMP" && chmod "$1" "$PUT_TMP" \
+    && mv -f "$PUT_TMP" "$4" \
+    || { rm -f "$PUT_TMP"; die "could not install $4; what was there before is untouched"; }
+  PUT_TMP=""
+}
+# --- put (end)
 
 DRY_RUN=0
 for arg in "$@"; do
@@ -249,12 +273,11 @@ sudo -u "$RUN_USER" test -x "$UV" \
 # Check the credential BEFORE downloading or replacing anything. Fail here, with a
 # useful reason, while the operator is still watching the terminal. A dry run without
 # a token still proves the gateway is the one it would download from.
+# --- token check (begin)
 if [ -n "$OCM_HOST_TOKEN" ]; then
   printf 'checking your provider token …\n'
-  VERIFY=$(curl_https --fail -H "Authorization: Bearer $OCM_HOST_TOKEN" \
-    "$SOURCE/v1/provider/verify" 2>/dev/null) || {
-    REASON=$(curl_https -H "Authorization: Bearer $OCM_HOST_TOKEN" \
-      "$SOURCE/v1/provider/verify" 2>/dev/null \
+  VERIFY=$(curl_bearer --fail "$SOURCE/v1/provider/verify" 2>/dev/null) || {
+    REASON=$(curl_bearer "$SOURCE/v1/provider/verify" 2>/dev/null \
       | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
     die "${REASON:-could not reach $SOURCE to check the token}"
   }
@@ -273,6 +296,7 @@ else
     CREDENTIAL="none given; the real run prompts for one with typing hidden"
   fi
 fi
+# --- token check (end)
 
 printf 'OCM provider install\n  host    %s (%s)\n  user    %s\n  gateway %s\n  serving %s\n\n' \
   "$AGENT_ID" "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo mac)" \
@@ -296,6 +320,18 @@ if [ "$DRY_RUN" = 1 ]; then
   else
     CACHE="absent; about 4.5 GB downloads on the first request, not during install"
   fi
+  # The build the gateway would install is the first twelve characters of the checksum
+  # it publishes for agent.py; the real run refuses a download that does not match it.
+  SERVED=$(curl_https --fail "$SOURCE/agent.py.sha256" 2>/dev/null | cut -c1-12)
+  if [ -z "$SERVED" ]; then
+    BUILD="unknown; $SOURCE/agent.py.sha256 could not be fetched, and the real run stops there"
+  elif [ -r "$PREFIX/agent/agent.py" ]; then
+    INSTALLED=$(shasum -a 256 "$PREFIX/agent/agent.py" | cut -c1-12)
+    if [ "$INSTALLED" = "$SERVED" ]; then BUILD="$SERVED, the build already installed"
+    else BUILD="$SERVED served; $INSTALLED installed now"; fi
+  else
+    BUILD="$SERVED served; none installed"
+  fi
   cat <<PLAN
 dry run
   name        $AGENT_ID ($AGENT_ID_FROM)
@@ -304,11 +340,13 @@ dry run
   daemon      $DAEMON
   region      ${REGION:-local}
   uv          $UV
+  build       $BUILD
   model       $HUB
               $CACHE
 
 would write, as root
-  $PREFIX/agent/agent.py                      755, only after its --doctor passes as $RUN_USER
+  $PREFIX/agent/agent.py                      755, only after it matches $SOURCE/agent.py.sha256
+                                              and its --doctor passes as $RUN_USER
   $PREFIX/bin/ocm-agent-run                   755, generated; holds no token
   $PREFIX/bin/ocm-agent-token                 755
   $PREFIX/bin/ocm-agent-update                755
@@ -317,24 +355,42 @@ would write, as root
   /var/log/ocm-agent.log                       600, owned by $RUN_USER
   /Library/LaunchDaemons/com.ocm.agent.plist   644, runs ocm-agent-run as $RUN_USER
 
-nothing else. Undo later with: sudo $PREFIX/bin/ocm-agent-uninstall
+nothing else. Each file is written beside its destination and renamed into place, so
+a failure mid-write leaves what is there now untouched.
+Undo later with: sudo $PREFIX/bin/ocm-agent-uninstall
 
 dry run; nothing was changed
 PLAN
   exit 0
 fi
 
-# Download to a private temporary file and prove the new agent's diagnostic path as
-# the same unprivileged account that launchd will use. Only then replace installed
-# files. HTTPS authenticates the current gateway; broad deployment still requires a
-# release artifact pinned to an immutable digest.
+# Download into a private work directory, check the agent against the checksum the
+# gateway publishes for it, and prove the new agent's diagnostic path as the same
+# unprivileged account that launchd will use. Only then replace installed files. The
+# checksum comes from the same origin as the code, so it catches a truncated or
+# drifted download, not a compromised gateway; HTTPS authenticates the gateway, and
+# broad deployment still requires a release artifact pinned to an immutable digest.
 umask 077
-TMP_AGENT=$(mktemp "${TMPDIR:-/tmp}/ocm-agent.XXXXXX")
-trap 'rm -f "$TMP_AGENT"' EXIT HUP INT TERM
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/ocm-install.XXXXXX")
+trap 'rm -rf "$WORK"; [ -z "$PUT_TMP" ] || rm -f "$PUT_TMP"' EXIT HUP INT TERM
+# The directory is root-owned, so nobody else can rename or replace what is in it; it
+# is traversable because the runtime account must reach the download to prove it.
+# The generated files staged here hold no secret except agent.env, which stays 600.
+chmod 755 "$WORK"
+# --- agent download (begin)
+TMP_AGENT="$WORK/agent.py"
 printf 'downloading agent …\n'
 curl_https --fail "$SOURCE/agent.py" -o "$TMP_AGENT" \
   || die "could not fetch $SOURCE/agent.py"
+curl_https --fail "$SOURCE/agent.py.sha256" -o "$WORK/agent.py.sha256" \
+  || die "could not fetch $SOURCE/agent.py.sha256; nothing was installed"
+# The published line is `<sha256>  agent.py`, the shape shasum -c reads, so the check
+# runs where the download carries that name — the same pin ocm-agent-update applies
+# to the installer itself.
+( cd "$WORK" && shasum -a 256 -c agent.py.sha256 >/dev/null 2>&1 ) \
+  || die "the downloaded agent does not match its published checksum; nothing was installed"
 chmod 755 "$TMP_AGENT"
+# --- agent download (end)
 
 printf 'checking the downloaded agent as %s …\n' "$RUN_USER"
 # Leave the caller's directory first. Run from root's home (an operator over SSM,
@@ -350,24 +406,25 @@ sudo -u "$RUN_USER" --preserve-env=OCM_HOST_TOKEN env \
   || die "downloaded agent doctor failed — no installed files were changed"
 
 mkdir -p "$PREFIX/agent" "$PREFIX/bin"
-install -m 755 "$TMP_AGENT" "$PREFIX/agent/agent.py"
+put 755 root "$TMP_AGENT" "$PREFIX/agent/agent.py"
 
 # The token lives in an owner-only file, never in the plist — plists are
-# world-readable. The provider process runs as RUN_USER, not as root.
+# world-readable. The provider process runs as RUN_USER, not as root. The generated
+# files below are staged in the work directory and published with put, so a reinstall
+# never leaves a half-written file where a working one was.
 install -d -m 700 /etc/ocm
 chown "$RUN_USER" /etc/ocm
 umask 077
-cat > /etc/ocm/agent.env <<ENV
+cat > "$WORK/agent.env" <<ENV
 OCM_HOST_TOKEN=$OCM_HOST_TOKEN
 OCM_GATEWAY_URL=$GATEWAY
 OCM_AGENT_ID=$AGENT_ID
 OCM_MODEL_MAP=$MODEL_MAP
 ENV
-[ -z "$REGION" ] || printf 'OCM_REGION=%s\n' "$REGION" >> /etc/ocm/agent.env
-chown "$RUN_USER" /etc/ocm/agent.env
-chmod 600 /etc/ocm/agent.env
+[ -z "$REGION" ] || printf 'OCM_REGION=%s\n' "$REGION" >> "$WORK/agent.env"
+put 600 "$RUN_USER" "$WORK/agent.env" /etc/ocm/agent.env
 
-cat > "$PREFIX/bin/ocm-agent-run" <<RUN
+cat > "$WORK/ocm-agent-run" <<RUN
 #!/bin/bash
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin:$RUN_HOME/.local/bin
 export HOME="$RUN_HOME"
@@ -378,12 +435,12 @@ RUN
 # secret — the token lives in /etc/ocm/agent.env — so root-only mode protects nothing
 # and blocks the owner (or their agent) from reading back what was just installed,
 # which is exactly the verification this script asks people to perform.
-chmod 755 "$PREFIX/bin/ocm-agent-run"
+put 755 root "$WORK/ocm-agent-run" "$PREFIX/bin/ocm-agent-run"
 
 # Rotating a token had no supported path, so people edited ocm-agent-run by hand —
 # which silently breaks the daemon, because that file is regenerated on reinstall
 # and is not where the token lives. This is the one command that does it correctly.
-cat > "$PREFIX/bin/ocm-agent-token" <<'TOK'
+cat > "$WORK/ocm-agent-token" <<'TOK'
 #!/bin/sh
 # Replace this machine's provider token and restart the agent.
 #   sudo /opt/ocm/bin/ocm-agent-token              # prompts, input hidden
@@ -420,19 +477,20 @@ elif [ -t 0 ]; then
 else
   IFS= read -r NEW_TOKEN || true
 fi
-OWNER=$(stat -f '%Su' /etc/ocm/agent.env 2>/dev/null || true)
+ENV=/etc/ocm/agent.env
+OWNER=$(stat -f '%Su' "$ENV" 2>/dev/null || true)
 printf '%s\n' "$OWNER" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' \
   || { echo "error: could not identify the provider account" >&2; exit 1; }
 [ "$OWNER" != root ] || { echo "error: the provider environment may not be owned by root" >&2; exit 1; }
-BASE=$(sed -n 's|^OCM_GATEWAY_URL=||p' /etc/ocm/agent.env | sed 's|^wss://|https://|')
+BASE=$(sed -n 's|^OCM_GATEWAY_URL=||p' "$ENV" | sed 's|^wss://|https://|')
 printf '%s\n' "$BASE" | LC_ALL=C grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$' \
-  || { echo "error: unsafe or missing gateway URL in /etc/ocm/agent.env" >&2; exit 1; }
+  || { echo "error: unsafe or missing gateway URL in $ENV" >&2; exit 1; }
 # An enrollment code from the console is exchanged for a token bound to this machine,
 # using the agent id already recorded here; the old token is revoked by the gateway.
 if printf '%s\n' "$NEW_TOKEN" | LC_ALL=C grep -Eq '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then
-  AGENT_ID=$(sed -n 's|^OCM_AGENT_ID=||p' /etc/ocm/agent.env)
+  AGENT_ID=$(sed -n 's|^OCM_AGENT_ID=||p' "$ENV")
   printf '%s\n' "$AGENT_ID" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' \
-    || { echo "error: unsafe or missing OCM_AGENT_ID in /etc/ocm/agent.env" >&2; exit 1; }
+    || { echo "error: unsafe or missing OCM_AGENT_ID in $ENV" >&2; exit 1; }
   printf 'exchanging the enrollment code ...\n'
   ENROLL_BODY="{\"code\":\"$NEW_TOKEN\",\"agent_id\":\"$AGENT_ID\"}"
   ENROLL=$(printf '%s' "$ENROLL_BODY" | curl --silent --show-error --location --fail \
@@ -453,44 +511,56 @@ fi
 printf '%s\n' "$NEW_TOKEN" | LC_ALL=C grep -Eq '^ocm_host_[-A-Za-z0-9_]{16,}$' \
   || { echo "error: expected an issued ocm_host_ provider token" >&2; exit 1; }
 printf 'checking token ...\n'
-if ! curl --silent --show-error --location --fail \
+# --- rotation token check (begin)
+# The token reaches curl as one config line on stdin (-K -), never as an argument:
+# -H "Authorization: Bearer …" is argv, readable by every local process for the life
+# of the request. printf is a builtin, so the value is never an argument to any process.
+bearer() { printf 'header = "Authorization: Bearer %s"\n' "$NEW_TOKEN"; }
+if ! bearer | curl --silent --show-error --location --fail \
   --proto '=https' --proto-redir '=https' --tlsv1.2 \
-  -H "Authorization: Bearer $NEW_TOKEN" "$BASE/v1/provider/verify" >/dev/null 2>&1; then
-  curl --silent --show-error --location \
+  -K - "$BASE/v1/provider/verify" >/dev/null 2>&1; then
+  bearer | curl --silent --show-error --location \
     --proto '=https' --proto-redir '=https' --tlsv1.2 \
-    -H "Authorization: Bearer $NEW_TOKEN" "$BASE/v1/provider/verify" 2>/dev/null \
+    -K - "$BASE/v1/provider/verify" 2>/dev/null \
     | sed -n 's/.*"message":"\([^"]*\)".*/error: \1/p' >&2
   echo "nothing was changed" >&2
   exit 1
 fi
+# --- rotation token check (end)
+# --- env rewrite (begin)
+# Written beside the target and renamed into place: a failure mid-write leaves the
+# old file whole rather than truncated, and the mode and owner are set before the
+# file is visible under its name. The temporary file is a sibling, not in $TMPDIR, so
+# the rename is atomic and never a copy across filesystems.
 umask 077
-TMP=$(mktemp "${TMPDIR:-/tmp}/ocm-token.XXXXXX")
+TMP=$(mktemp "$ENV.XXXXXX")
 trap 'rm -f "$TMP"' EXIT HUP INT TERM
-grep -v '^OCM_HOST_TOKEN=' /etc/ocm/agent.env > "$TMP" || true
-printf 'OCM_HOST_TOKEN=%s\n' "$NEW_TOKEN" >> "$TMP"
-cat "$TMP" > /etc/ocm/agent.env
-chown "$OWNER" /etc/ocm/agent.env
-chmod 600 /etc/ocm/agent.env
+{ grep -v '^OCM_HOST_TOKEN=' "$ENV" || true; printf 'OCM_HOST_TOKEN=%s\n' "$NEW_TOKEN"; } > "$TMP"
+chown "$OWNER" "$TMP"
+chmod 600 "$TMP"
+mv -f "$TMP" "$ENV"
+trap - EXIT HUP INT TERM
+# --- env rewrite (end)
 launchctl kickstart -k system/com.ocm.agent
 echo "token accepted, written, and agent restarted."
 echo "watch it connect:  tail -f /var/log/ocm-agent.log"
 TOK
-chmod 755 "$PREFIX/bin/ocm-agent-token"   # readable for the same reason
+put 755 root "$WORK/ocm-agent-token" "$PREFIX/bin/ocm-agent-token"   # readable for the same reason
 
 # Fixes reached existing hosts only on reinstall, and a reinstall needs a token that
 # was shown once; a bare file swap leaves old modes and config behind. This does the
 # reinstall with what is already on disk, so nothing is retyped and nothing is skipped.
-cat > "$PREFIX/bin/ocm-agent-update" <<'UPD'
+cat > "$WORK/ocm-agent-update" <<'UPD'
 #!/bin/sh
 # Move this machine to the current agent build without retyping anything.
 #   sudo /opt/ocm/bin/ocm-agent-update            # update
 #   sudo /opt/ocm/bin/ocm-agent-update --check    # report only; change nothing
 #
-# It reads /etc/ocm/agent.env, fetches the current installer from the same gateway,
-# verifies the published checksum, and runs the installer with the token handed over
-# in a root-only temporary file — never on a command line. The installer then proves
-# the new agent's doctor path as the runtime account before replacing anything,
-# exactly as a first install does.
+# It reads /etc/ocm/agent.env, fetches the current installer and agent from the same
+# gateway, verifies both against their published checksums, and runs the installer
+# with the token handed over in a root-only temporary file — never on a command line.
+# The installer checks the agent again and proves its doctor path as the runtime
+# account before replacing anything, exactly as a first install does.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
@@ -503,9 +573,11 @@ case "${1:-}" in
   *) echo "usage: ocm-agent-update [--check]" >&2; exit 1 ;;
 esac
 umask 077
-# The installer rewrites this very file while it runs, and sh reads scripts lazily
-# by byte offset, so the live file only takes a private snapshot of itself and runs
-# that. The snapshot inherits the work directory; the live file owns its cleanup.
+# The installer replaces this very file while it runs. It renames a new file over the
+# path, so the running copy keeps its old inode, but sh reads scripts lazily by byte
+# offset and a snapshot costs nothing, so the live file only takes a private snapshot
+# of itself and runs that. The snapshot inherits the work directory; the live file
+# owns its cleanup.
 if [ -z "${OCM_UPDATE_WORK:-}" ]; then
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/ocm-update.XXXXXX")
   trap 'rm -rf "$WORK"' EXIT HUP INT TERM
@@ -542,6 +614,12 @@ fetch "$BASE/install.sh.sha256" -o "$WORK/install.sh.sha256" \
   || { echo "error: the downloaded installer does not match its published checksum; nothing was changed" >&2; exit 1; }
 fetch "$BASE/agent.py" -o "$WORK/agent.py" \
   || { echo "error: could not fetch $BASE/agent.py" >&2; exit 1; }
+fetch "$BASE/agent.py.sha256" -o "$WORK/agent.py.sha256" \
+  || { echo "error: could not fetch the agent checksum" >&2; exit 1; }
+# A truncated or drifted download must not be reported as a new build, let alone
+# installed; the installer repeats this check on its own download.
+( cd "$WORK" && shasum -a 256 -c agent.py.sha256 >/dev/null 2>&1 ) \
+  || { echo "error: the downloaded agent does not match its published checksum; nothing was changed" >&2; exit 1; }
 if cmp -s "$WORK/agent.py" /opt/ocm/agent/agent.py; then AGENT_STATE="already current"
 else AGENT_STATE="new build available"; fi
 printf 'OCM provider update\n  host     %s\n  user     %s\n  gateway  %s\n  agent    %s\n' \
@@ -559,12 +637,12 @@ OCM_HOST_TOKEN_FILE="$WORK/token" OCM_AGENT_ID="$AGENT_ID" OCM_MODEL_MAP="$MODEL
   OCM_RUN_USER="$OWNER" OCM_UV_BIN="$UV" OCM_GATEWAY_URL="$GATEWAY" \
   sh "$WORK/install.sh"
 UPD
-chmod 755 "$PREFIX/bin/ocm-agent-update"
+put 755 root "$WORK/ocm-agent-update" "$PREFIX/bin/ocm-agent-update"
 
 # Uninstall used to be a printed `rm -rf`, which nobody previews and which left the
 # model download behind. This removes exactly what the installer wrote, can be asked
 # what it would do first, and deletes the model only when told to, and only that model.
-cat > "$PREFIX/bin/ocm-agent-uninstall" <<'UNINST'
+cat > "$WORK/ocm-agent-uninstall" <<'UNINST'
 #!/bin/sh
 # Remove the OCM provider agent from this Mac.
 #   sudo /opt/ocm/bin/ocm-agent-uninstall                 # stop and remove; keep the model
@@ -654,7 +732,7 @@ DONE
 }
 main "$@"
 UNINST
-chmod 755 "$PREFIX/bin/ocm-agent-uninstall"
+put 755 root "$WORK/ocm-agent-uninstall" "$PREFIX/bin/ocm-agent-uninstall"
 
 # launchd opens the log as RUN_USER. Pre-create it owner-only rather than relying on
 # launchd to create a world-readable root log or failing because /var/log is closed.
@@ -662,7 +740,7 @@ touch /var/log/ocm-agent.log
 chown "$RUN_USER" /var/log/ocm-agent.log
 chmod 600 /var/log/ocm-agent.log
 
-cat > /Library/LaunchDaemons/com.ocm.agent.plist <<PLIST
+cat > "$WORK/com.ocm.agent.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -677,7 +755,7 @@ cat > /Library/LaunchDaemons/com.ocm.agent.plist <<PLIST
   <key>WorkingDirectory</key><string>$PREFIX</string>
 </dict></plist>
 PLIST
-chmod 644 /Library/LaunchDaemons/com.ocm.agent.plist
+put 644 root "$WORK/com.ocm.agent.plist" /Library/LaunchDaemons/com.ocm.agent.plist
 
 # bootout is ASYNCHRONOUS. Bootstrapping while teardown is still in flight fails
 # with "Bootstrap failed: 5: Input/output error", and under `set -eu` the script
@@ -696,7 +774,7 @@ if ! launchctl bootstrap system /Library/LaunchDaemons/com.ocm.agent.plist; then
   Then:   sudo -u $RUN_USER $PREFIX/bin/ocm-agent-run --doctor"
 fi
 
-rm -f "$TMP_AGENT"
+rm -rf "$WORK"
 trap - EXIT HUP INT TERM
 
 # The build is the agent file's SHA-256; the doctor, the console and the status page
