@@ -17,22 +17,7 @@ if (!eventName) {
   process.exit(1);
 }
 
-function generateBreakpoint2026Ticket() {
-  return {
-    title: "Breakpoint 2026",
-    date: "2026-09-07",
-    description: "Ticket for Breakpoint 2026 bounty: machine-paid inference video",
-    requirements: [
-      "one original English X post expressing excitement for Breakpoint",
-      "a clear Germany / Superteam Germany angle",
-      "tag `@SolanaEvents` and `@SuperteamDE`",
-      "quote-retweet the sponsor's announcement with a thoughtful comment",
-      "submit both URLs through Superteam Earn",
-      "video is favored"
-    ],
-    reward: "$800 ticket code (not cash, no travel)"
-  };
-}
+const generateBreakpoint2026Ticket = require('./breakpoint2026');
 
 let ticket;
 switch (eventName) {
