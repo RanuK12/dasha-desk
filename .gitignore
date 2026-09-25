@@ -26,3 +26,4 @@ ocm/**/cdk.out/
 # Working notes for Claude — operator context, not project documentation.
 # Excluded for now; promote deliberately if it ever becomes public guidance.
 CLAUDE.md
+.aider*
