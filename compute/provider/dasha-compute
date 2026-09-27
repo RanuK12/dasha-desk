@@ -13,7 +13,7 @@ case "${1:-status}" in
   status)
     if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "Dasha Compute is running as $DASHA_PROVIDER_ID."; else echo "Dasha Compute is stopped."; exit 1; fi
     ;;
-  doctor) run_agent --doctor ;;
+  doctor) shift; run_agent --doctor "$@" ;;
   benchmark) run_agent --benchmark ;;
   logs) exec tail -n 100 -f "$HOME/Library/Logs/Dasha Compute/provider.log" "$HOME/Library/Logs/Dasha Compute/provider-error.log" ;;
   start) launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true; launchctl kickstart -k "gui/$(id -u)/$LABEL" ;;
