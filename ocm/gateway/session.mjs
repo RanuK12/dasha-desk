@@ -49,6 +49,25 @@ export function readSession(secret, token) {
   return { accountId, credentialId };
 }
 
+/**
+ * CSRF token for a session (review P2-9). `SameSite=Strict` on the cookie already
+ * stops a classic cross-site form post, but it is one browser policy standing in for
+ * a server-side check, and it says nothing about a same-site sibling origin. The
+ * token is an HMAC over the session cookie itself under a domain-separated key, so
+ * it is stateless like the session, unique to this sign-in, and useless on its own:
+ * a page can only render it after the cookie has been verified, and a request can
+ * only pass the check by carrying both. A different session's token never matches.
+ */
+export const csrfToken = (secret, sessionToken) =>
+  createHmac('sha256', effectiveSessionSecret(secret)).update(`csrf:${sessionToken}`).digest('base64url');
+
+export function csrfOk(secret, sessionToken, given) {
+  if (!sessionToken || typeof given !== 'string' || !given) return false;
+  const a = Buffer.from(given, 'utf8');
+  const b = Buffer.from(csrfToken(secret, sessionToken), 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export const cookieHeader = (token, { secure = true } = {}) =>
   `ocm_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${MAX_AGE_S}` +
   (secure ? '; Secure' : '');

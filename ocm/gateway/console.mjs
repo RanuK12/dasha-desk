@@ -31,6 +31,12 @@ const ago = (d) => {
   return `${Math.floor(s / 86400)}d ago`;
 };
 
+// A host answers in about a second when its model is resident: `warm` is what the
+// gateway saw (a first chunk), `ready` is what the host itself reported (a preload,
+// or a job served before this gateway connected). Absent `ready` is unknown, and an
+// unknown, never-served host renders cold exactly as it did before the ready bit.
+const resident = (h) => !!(h.warm || h.ready);
+
 /**
  * One table, four steps: code issued, enrolled, first connected, first job. Shared by
  * the owner's dashboard and the admin network view (which adds the owner column).
@@ -45,7 +51,7 @@ function earningsSection(earn, machineIds, live) {
   const rows = machineIds.map((id) => {
     const e = earn.hosts[id] || zero;
     const h = live.get(id);
-    return `<tr><td><span class="dot ${h && (h.inflight || h.warm) ? 'on' : 'off'}"></span><code>${esc(id)}</code></td>
+    return `<tr><td><span class="dot ${h && (h.inflight || resident(h)) ? 'on' : 'off'}"></span><code>${esc(id)}</code></td>
     <td>${num(e.today)}</td><td>${num(e.week)}</td><td>${num(e.all)}</td><td>${num(e.requests)}</td>
     <td>${e.last_at ? esc(ago(e.last_at)) : '<span class="muted">never</span>'}</td></tr>`;
   }).join('');
@@ -83,7 +89,7 @@ function funnelTable(rows, { live, firstServed, credited, owner = null }) {
   const body = rows.map((r) => {
     const h = r.agent_id ? live.get(r.agent_id) : null;
     const now = r.pending ? '<span class="muted">waiting for the installer</span>'
-      : h ? `${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Online, cold'}${updateAvailable(h.build_state) ? ' <span class="warn-text">· update available</span>' : ''}`
+      : h ? `${h.inflight ? 'Serving' : resident(h) ? 'Ready' : 'Online, cold'}${updateAvailable(h.build_state) ? ' <span class="warn-text">· update available</span>' : ''}`
       : r.first_connected_at ? `<span class="muted">offline, seen ${esc(ago(r.last_connected_at))}</span>`
       : '<span class="muted">never connected</span>';
     const name = r.agent_id ? `<code>${esc(r.agent_id)}</code>`
@@ -116,8 +122,9 @@ export async function stats(registry, ledger) {
     models: [...h.models],
     inflight: h.inflight.size,
     // Same evidence /v1/network publishes: will this host answer in about a second,
-    // or does it have to load a model first.
+    // or does it have to load a model first. `warm` we saw; `ready` the host said.
     warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
+    ready: h.ready,
     uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
     credited: led.creditedByHost[h.id] || 0,
   }));
@@ -128,8 +135,13 @@ export async function stats(registry, ledger) {
     consumers: led.consumers,
     totals: led.totals,
     recent: led.recent,
+    // Carried so the pages built on this payload need no second summary() (P3-4).
+    creditedByHost: led.creditedByHost,
   };
 }
+
+/** Rows the admin network view shows per table before it asks (P2-10). */
+export const NETWORK_ROWS = 50;
 
 const STYLE = `
 :root{--bg:#fbfbfa;--fg:#1a1a19;--dim:#6b6b66;--line:#e4e3df;--card:#fff;--ok:#1a7f47;--idle:#9a9a94;--warn:#b45309;--accent:#1a1a19}
@@ -229,12 +241,29 @@ claimed that the architecture cannot enforce.</footer>` : ''}</div></body></html
  * rather than widening the page. Nothing here is hidden by overflow — every link
  * and the button stay reachable at any width.
  */
-const nav = (email, admin = false) => `<nav>
+/**
+ * The hidden field every signed-in form carries (review P2-9). The server checks it
+ * on each console POST that needs a session; a form without it is refused with 403.
+ */
+const csrfField = (csrf) => `<input type="hidden" name="csrf" value="${esc(csrf || '')}">`;
+
+const nav = (email, admin = false, csrf = '') => `<nav>
   <div class="links"><strong>OCM</strong>
     <a href="/">Overview</a><a href="/provider">Run a provider</a><a href="/developer">Developers</a><a href="/status">Status</a>${admin ? '<a href="/network">Network</a>' : ''}</div>
   ${email ? `<div class="who"><a href="/profile">Profile</a><span class="muted" title="${esc(email)}">${esc(email)}</span>
-    <form method="post" action="/signout"><button class="ghost" style="margin:0;padding:6px 12px">Sign out</button></form></div>`
+    <form method="post" action="/signout">${csrfField(csrf)}<button class="ghost" style="margin:0;padding:6px 12px">Sign out</button></form></div>`
     : `<div class="who"><a class="muted" href="/">Sign in or create an account</a></div>`}</nav>`;
+
+/**
+ * A refused form post. Plain on purpose: it names the reason in one line and offers
+ * the way back, and it carries no account data, since the request that reached it
+ * was by definition not one the console trusts.
+ */
+export function renderRefused({ reason }) {
+  return page('Request refused', `<h1>Request refused</h1>
+<p class="sub">${esc(reason)}</p>
+<p><a href="/">Back to the console</a> and try again from there.</p>`, { footer: false });
+}
 
 /** Shown exactly once — the plaintext is not recoverable afterwards. */
 export function renderSecret({ title, secret, whatNext }) {
@@ -297,6 +326,18 @@ longer hold from the console afterwards.</p>
 in 30 minutes; nothing has changed.</p>`);
 }
 
+/**
+ * 429 for a throttled console form. Deliberately says nothing about the key, code or
+ * address that was submitted: the same page for a stranger guessing and for a person
+ * who mistyped, so it cannot become an oracle.
+ */
+export function renderRateLimited({ retryAfter }) {
+  const secs = Math.max(1, Math.floor(Number(retryAfter) || 1));
+  return page('Too many requests', `<h1>Too many requests</h1>
+<p class="sub">Please wait ${secs} second${secs === 1 ? '' : 's'} and try again.
+<a href="/">Back to the console</a>.</p>`);
+}
+
 export function renderRecoverInvalid() {
   return page('Recovery link not valid', `<h1>That link is not valid</h1>
 <p class="sub">It may have been used already, or it has expired. Links work once and last 30
@@ -333,7 +374,7 @@ be refused — you can redeem one from the console later. Credits are not money;
 is no billing.</div>`);
 }
 
-export async function renderDashboard({ registry, ledger, accounts, account, apiHost, notice, error, redeemed, inviteRequired, admin = false }) {
+export async function renderDashboard({ registry, ledger, accounts, account, apiHost, notice, error, redeemed, inviteRequired, admin = false, csrf = '' }) {
   const s = await stats(registry, ledger);
   const mine = s.consumers.find((c) => c.consumer === account.id)
     || { granted: 0, used: 0, balance: 0, requests: 0 };
@@ -343,9 +384,8 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
   const funnel = typeof accounts.funnel === 'function'
     ? (await accounts.funnel(account.id)).filter((r) => !r.revoked_at) : [];
   const firstServed = typeof ledger.firstServedByHost === 'function' ? await ledger.firstServedByHost() : {};
-  const led = await ledger.summary();
   const live = new Map(s.hosts.map((h) => [h.id, h]));
-  const funnelHtml = funnelTable(funnel, { live, firstServed, credited: led.creditedByHost });
+  const funnelHtml = funnelTable(funnel, { live, firstServed, credited: s.creditedByHost });
   // Earnings (P5): every machine this account has enrolled or connected, whether or not
   // it is online now. Scoped by machine id, so another account's providers never enter.
   const machineIds = [...new Set([...funnel.map((r) => r.agent_id).filter(Boolean), ...myHosts.map((h) => h.id)])];
@@ -363,9 +403,9 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
     <td>${c.last_used_at ? new Date(c.last_used_at).toISOString().slice(0, 10) : 'never'}</td>
     <td>${c.revoked_at ? '<span class="muted">revoked</span>'
       : `${c.kind === 'provider_token' && c.bound_agent_id
-          ? `<form method="post" action="/keys/rebind" style="display:inline"><input type="hidden" name="credential_id" value="${esc(c.id)}">
+          ? `<form method="post" action="/keys/rebind" style="display:inline">${csrfField(csrf)}<input type="hidden" name="credential_id" value="${esc(c.id)}">
              <button class="ghost" style="margin:0;padding:5px 10px">Release</button></form> `
-          : ''}<form method="post" action="/keys/revoke" style="display:inline"><input type="hidden" name="credential_id" value="${esc(c.id)}">
+          : ''}<form method="post" action="/keys/revoke" style="display:inline">${csrfField(csrf)}<input type="hidden" name="credential_id" value="${esc(c.id)}">
          <button class="ghost" style="margin:0;padding:5px 10px">Revoke</button></form>`}</td>
   </tr>`).join('') : '';
 
@@ -380,14 +420,14 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
 refused until an invite code is redeemed. One redemption per account.
 <strong>This does not affect running a provider</strong> — contributing a Mac needs no
 invite code, and earns credits as it serves.</div>
-<form class="card" method="post" action="/redeem" style="margin-bottom:8px">
+<form class="card" method="post" action="/redeem" style="margin-bottom:8px">${csrfField(csrf)}
   <h3>Redeem an invite code</h3>
   <label for="rc">Invite code</label>
   <input id="rc" type="text" name="invite" autocomplete="off" required>
   <button type="submit">Redeem</button>
 </form>`;
 
-  return page('OCM console', `${nav(account.email, admin)}
+  return page('OCM console', `${nav(account.email, admin, csrf)}
 ${notice ? `<div class="note">${esc(notice)}</div>` : ''}
 ${error ? `<div class="note warn">${esc(error)}</div>` : ''}
 ${redeemBlock}
@@ -419,17 +459,17 @@ token claims the first machine that uses it and will not work from another one.
 ${pending.length ? `<p class="muted" style="margin-top:8px">${pending.length} enrollment code${pending.length === 1 ? '' : 's'} outstanding;
 the newest expires in ${Math.max(1, Math.round((new Date(pending[0].expires_at) - Date.now()) / 60000))} min. Unused codes expire harmlessly.</p>` : ''}
 <div class="row" style="margin-top:12px">
-  <form class="card" method="post" action="/enroll">
+  <form class="card" method="post" action="/enroll">${csrfField(csrf)}
     <h3>Enroll a Mac</h3><p class="muted">Get a one-time code, valid 15 minutes. The installer
     exchanges it for a token only that machine can use; re-enrolling rotates it.</p>
     <label for="l0">Machine name</label><input id="l0" type="text" name="label" placeholder="mac mini">
     <button type="submit">Get enrollment code</button></form>
-  <form class="card" method="post" action="/keys/new">
+  <form class="card" method="post" action="/keys/new">${csrfField(csrf)}
     <input type="hidden" name="kind" value="developer_key">
     <h3>New developer key</h3><p class="muted">For calling the API.</p>
     <label for="l1">Label</label><input id="l1" type="text" name="label" placeholder="laptop">
     <button type="submit">Issue key</button></form>
-  <form class="card" method="post" action="/keys/new">
+  <form class="card" method="post" action="/keys/new">${csrfField(csrf)}
     <input type="hidden" name="kind" value="provider_token">
     <h3>New provider token</h3><p class="muted">For automation that needs a long-lived
     credential. For a Mac you are setting up by hand, enroll it instead.</p>
@@ -469,17 +509,19 @@ export async function renderStatus({ registry, ledger }) {
     models: [...h.models],
     inflight: h.inflight.size,
     warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
+    ready: h.ready,
     uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
   }));
   // An idle host that has not loaded a model is cold, not warming: nothing is
-  // happening until a request arrives, and then it takes about a minute.
-  const state = (h) => h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Cold';
+  // happening until a request arrives, and then it takes about a minute. A host
+  // that says its model is loaded (a preload) is Ready before it has served anyone.
+  const state = (h) => h.inflight ? 'Serving' : resident(h) ? 'Ready' : 'Cold';
   const models = registry.models();
   const allTime = led.totals.prompt_tokens + led.totals.completion_tokens;
   const todayTokens = today.prompt_tokens + today.completion_tokens;
 
   const hostRows = hosts.map((h) => `<tr>
-    <td><span class="dot ${h.inflight || h.warm ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
+    <td><span class="dot ${h.inflight || resident(h) ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
     <td>${state(h)}</td>
     <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td><td>${esc(h.region)}</td>
     <td>${esc(h.models.join(', ') || '—')}</td>
@@ -500,7 +542,8 @@ export async function renderStatus({ registry, ledger }) {
 <thead><tr><th>Host</th><th>State</th><th>Chip</th><th>Memory</th><th>Region</th><th>Serving</th><th>Connected</th><th>Agent</th></tr></thead>
 <tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected right now.</div>'}</div>
 <p class="cap" style="margin-top:8px">Cold means the machine will load its model on the first request and answer in
-about a minute; Ready and Serving answer in about a second. Agent is the build each machine runs against the
+about a minute; Ready and Serving answer in about a second. A machine is Ready once it has served recently or
+reports its model loaded at start. Agent is the build each machine runs against the
 one this gateway serves${served ? ` (<code>${esc(shortBuild(served))}</code>)` : ''}; a machine that is behind still serves, and its owner updates it with one command.</p>
 
 <h2>Models</h2>
@@ -514,31 +557,53 @@ OpenAI-compatible client unmodified.</p>
 The same figures are available as JSON at <a href="/v1/network">/v1/network</a> on the API host.</p>`);
 }
 
-/** Admin-only: the whole network, with account emails. Never rendered to a non-admin. */
-export async function renderNetwork({ registry, ledger, accounts, account }) {
+/**
+ * Admin-only: the whole network, with account emails. Never rendered to a non-admin.
+ *
+ * Every table is capped at NETWORK_ROWS, newest first, with a "showing N of M" line
+ * and `?all=1` to lift the cap (review P2-10): the page is read on a phone as often
+ * as a desk, and a list that grows with the user base would otherwise grow without
+ * bound. The counters above the tables are always totals, never the capped count.
+ */
+export async function renderNetwork({ registry, ledger, accounts, account, csrf = '', all = false }) {
   const s = await stats(registry, ledger);
-  const all = await accounts.listAccounts();
-  const emailOf = new Map(all.map((a) => [a.id, a.email]));
+  const everyAccount = await accounts.listAccounts();
+  const emailOf = new Map(everyAccount.map((a) => [a.id, a.email]));
   const who = (id) => id ? esc(emailOf.get(id) || id) : '—';
   const funnelRows = typeof accounts.funnel === 'function'
     ? (await accounts.funnel()).filter((r) => !r.revoked_at) : [];
   const firstServed = typeof ledger.firstServedByHost === 'function' ? await ledger.firstServedByHost() : {};
-  const led = await ledger.summary();
-  const funnelAll = funnelTable(funnelRows, {
-    live: new Map(s.hosts.map((h) => [h.id, h])), firstServed, credited: led.creditedByHost, owner: who,
-  });
   const day = (d) => d ? new Date(d).toISOString().slice(0, 10) : 'never';
+  const ts = (d) => d ? new Date(d).getTime() : 0;
 
-  const hostRows = s.hosts.map((h) => `<tr>
+  // Newest first, then the cap. Sorting here rather than trusting each backend's
+  // order keeps the two stores interchangeable.
+  const cap = (rows) => {
+    const shown = all ? rows : rows.slice(0, NETWORK_ROWS);
+    const note = rows.length > shown.length
+      ? `<p class="muted" style="margin-top:8px">Showing ${num(shown.length)} of ${num(rows.length)}, newest first.
+  <a href="/network?all=1">Show all ${num(rows.length)}</a>.</p>` : '';
+    return { rows: shown, note };
+  };
+  const hosts = cap([...s.hosts].sort((a, b) => a.uptime_s - b.uptime_s));
+  const funnel = cap([...funnelRows].sort((a, b) => ts(b.issued_at) - ts(a.issued_at)));
+  const accts = cap([...everyAccount].sort((a, b) => ts(b.created_at) - ts(a.created_at)));
+  const recent = cap([...s.recent].sort((a, b) => ts(b.at) - ts(a.at)));
+
+  const funnelAll = funnelTable(funnel.rows, {
+    live: new Map(s.hosts.map((h) => [h.id, h])), firstServed, credited: s.creditedByHost, owner: who,
+  });
+
+  const hostRows = hosts.rows.map((h) => `<tr>
     <td><span class="dot ${h.inflight ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
     <td>${who(h.accountId)}</td>
-    <td>${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Cold'}</td>
+    <td>${h.inflight ? 'Serving' : resident(h) ? 'Ready' : 'Cold'}</td>
     <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td>
     <td>${esc(h.models.join(', ') || '—')}</td><td>${h.inflight}</td>
     <td>${dur(h.uptime_s)}</td><td>${num(h.credited)}</td><td>${buildCell(h)}</td></tr>`).join('');
 
   const byConsumer = new Map(s.consumers.map((c) => [c.consumer, c]));
-  const acctRows = all.map((a) => {
+  const acctRows = accts.rows.map((a) => {
     const c = byConsumer.get(a.id) || { granted: 0, used: 0, balance: 0, requests: 0 };
     return `<tr><td>${esc(a.email)}</td><td>${day(a.created_at)}</td>
     <td>${a.developer_keys}</td><td>${a.provider_tokens}</td>
@@ -546,17 +611,17 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
     <td>${day(a.last_used_at)}</td></tr>`;
   }).join('');
 
-  const recentRows = s.recent.map((r) => `<tr>
+  const recentRows = recent.rows.map((r) => `<tr>
     <td>${esc(new Date(r.at).toISOString().replace('T', ' ').slice(0, 19))}</td>
     <td>${who(r.consumer)}</td><td><code>${esc(r.host || '—')}</code></td>
     <td>${esc(r.model || '—')}</td><td>${num(r.promptTokens || 0)}</td><td>${num(r.completionTokens || 0)}</td></tr>`).join('');
 
-  return page('OCM network', `${nav(account.email, true)}
+  return page('OCM network', `${nav(account.email, true, csrf)}
 <h1>Network</h1>
 <p class="sub">Everything the gateway knows, across every account. Visible to administrators only.</p>
 <div class="grid">
   <div class="card"><div class="k">Providers online</div><div class="v">${s.hosts.length}</div></div>
-  <div class="card"><div class="k">Accounts</div><div class="v">${num(all.length)}</div></div>
+  <div class="card"><div class="k">Accounts</div><div class="v">${num(everyAccount.length)}</div></div>
   <div class="card"><div class="k">Requests</div><div class="v">${num(s.totals.requests)}</div></div>
   <div class="card"><div class="k">Prompt tokens</div><div class="v">${num(s.totals.prompt_tokens)}</div></div>
   <div class="card"><div class="k">Completion tokens</div><div class="v">${num(s.totals.completion_tokens)}</div></div>
@@ -565,28 +630,29 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
 <h2>Providers</h2>
 <div class="tablewrap">${hostRows ? `<table class="data">
 <thead><tr><th>Host</th><th>Owner</th><th>State</th><th>Chip</th><th>Memory</th><th>Models</th><th>In flight</th><th>Uptime</th><th>Credited</th><th>Agent</th></tr></thead>
-<tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected.</div>'}</div>
+<tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected.</div>'}</div>${hosts.note}
 
 <h2>Onboarding funnel</h2>
-<div class="tablewrap">${funnelAll || '<div class="empty">No provider machines yet.</div>'}</div>
+<div class="tablewrap">${funnelAll || '<div class="empty">No provider machines yet.</div>'}</div>${funnel.note}
 <p class="muted" style="margin-top:8px">Every provider machine across every account, with where its setup got to.
 Revoked tokens are omitted; a rotated machine shows its current token only.</p>
 
 <h2>Accounts</h2>
 <div class="tablewrap">${acctRows ? `<table class="data">
 <thead><tr><th>Email</th><th>Created</th><th>Dev keys</th><th>Host tokens</th><th>Balance</th><th>Used</th><th>Requests</th><th>Last used</th></tr></thead>
-<tbody>${acctRows}</tbody></table>` : '<div class="empty">No accounts.</div>'}</div>
+<tbody>${acctRows}</tbody></table>` : '<div class="empty">No accounts.</div>'}</div>${accts.note}
 
 <h2>Recent requests</h2>
 <div class="tablewrap">${recentRows ? `<table class="data">
 <thead><tr><th>When (UTC)</th><th>Consumer</th><th>Host</th><th>Model</th><th>Prompt</th><th>Completion</th></tr></thead>
-<tbody>${recentRows}</tbody></table>` : '<div class="empty">No requests yet.</div>'}</div>
+<tbody>${recentRows}</tbody></table>` : '<div class="empty">No requests yet.</div>'}</div>${recent.note}
+${all ? '<p class="muted" style="margin-top:12px">Showing every row. <a href="/network">Back to the capped view</a>.</p>' : ''}
 <p class="muted" style="margin-top:12px">Raw counters: <a href="/console/stats.json">stats.json</a> (anonymous, no emails).</p>`);
 }
 
-export function renderProviderGuide({ account = null, apiHost, models, admin = false, installHash = null }) {
+export function renderProviderGuide({ account = null, apiHost, models, admin = false, installHash = null, csrf = '' }) {
   const email = account ? account.email : '';
-  return page('Run a provider', `${nav(email, admin)}
+  return page('Run a provider', `${nav(email, admin, csrf)}
 <h1>Run a provider</h1>
 <p class="sub">Contribute an Apple Silicon Mac and earn credits for the tokens it serves.</p>
 
@@ -662,7 +728,10 @@ export function renderProviderGuide({ account = null, apiHost, models, admin = f
   <p class="cap">Expect <code>token ok</code>. Your Mac then appears on the
   <a href="/">console</a> under <strong>Your providers</strong>.</p>
   <div class="note">The first request your machine serves takes <strong>up to about 90
-  seconds</strong> while the model loads. Everything after that takes about a second.</div>
+  seconds</strong> while the model loads. Everything after that takes about a second.
+  To load it at start instead, add <code>OCM_PRELOAD=1</code> to <code>/etc/ocm/agent.env</code>
+  and run <code>sudo launchctl kickstart -k system/com.ocm.agent</code>; the model then holds
+  about 4.5 GB from boot, so this is off by default.</div>
 </div>
 
 <h2>Changing the token later</h2>
@@ -769,9 +838,9 @@ token. No invite code is needed to run a provider.</div>`}`);
  * go from zero to a first request. Public like /provider — it is the link the
  * "Run work on a Mac" button sends prospects to, and it holds no account data.
  */
-export function renderDeveloperGuide({ account = null, apiHost, models, admin = false }) {
+export function renderDeveloperGuide({ account = null, apiHost, models, admin = false, csrf = '' }) {
   const email = account ? account.email : '';
-  return page('Developers', `${nav(email, admin)}
+  return page('Developers', `${nav(email, admin, csrf)}
 <h1>Developers</h1>
 <p class="sub">One OpenAI-compatible API over idle Apple Silicon Macs. No SDK to install —
 anything that speaks the OpenAI API works unmodified.</p>
@@ -857,9 +926,9 @@ Have an idle Mac instead? <a href="/provider">Run a provider</a> — no invite c
  * what the account holds. It renders only the signed-in account's data — never
  * anyone else's — and links back to the console for acting on credentials.
  */
-export function renderProfile({ account, profile, admin = false }) {
+export function renderProfile({ account, profile, admin = false, csrf = '' }) {
   const day = (d) => d ? new Date(d).toISOString().slice(0, 10) : '—';
-  return page('Profile', `${nav(account.email, admin)}
+  return page('Profile', `${nav(account.email, admin, csrf)}
 <h1>Profile</h1>
 <p class="sub">Your account on this network.</p>
 
@@ -884,5 +953,5 @@ export function renderProfile({ account, profile, admin = false }) {
 
 <p class="muted" style="margin-top:12px">Keys, machines and enrollment live on the
 <a href="/">console</a>, where they can be issued, released and revoked.</p>
-<form method="post" action="/signout"><button class="ghost">Sign out</button></form>`);
+<form method="post" action="/signout">${csrfField(csrf)}<button class="ghost">Sign out</button></form>`);
 }

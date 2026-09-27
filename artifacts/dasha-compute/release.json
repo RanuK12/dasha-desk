@@ -1,7 +1,7 @@
 {
   "artifact": "dasha-compute-open-alpha.tar.gz",
-  "bytes": 198182,
-  "sha256": "7809ccbf5cce9ef14608891719dbd93eec1c2253a875ead5701b39e176134c30",
-  "sourceFileCount": 33,
+  "bytes": 272939,
+  "sha256": "706918197b633929b8963a27978bfab7dec5ed715fd8a83f32f04aa0d2152386",
+  "sourceFileCount": 38,
   "version": "0.3.0"
 }

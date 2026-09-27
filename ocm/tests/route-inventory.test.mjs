@@ -218,8 +218,8 @@ test('the rotation helper never takes a credential in argv', () => {
   // The helper prompts with echo off, or reads stdin / OCM_HOST_TOKEN_FILE; an
   // argument of any kind is refused outright rather than accepted with a warning.
   const src = readFileSync(new URL('../agent/install.sh', import.meta.url), 'utf8');
-  const helper = src.slice(src.indexOf("cat > \"$PREFIX/bin/ocm-agent-token\""),
-                           src.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-token"'));
+  const helper = src.slice(src.indexOf("cat > \"$WORK/ocm-agent-token\""),
+                           src.indexOf('put 755 root "$WORK/ocm-agent-token"'));
   assert.match(helper, /if \[ \$# -ne 0 \]; then/,
     'the helper must refuse any command-line argument');
   assert.match(helper, /stty -echo/,

@@ -20,6 +20,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { checkComputeRelease } from './watch-compute-release.mjs';
 import { leftoverHits } from './leftover-chess.test.mjs';
+// OFFICIAL_TG is the Telegram allowlist: exactly one invite passes, every other
+// t.me / telegram.me href fails. It moved to the owner's canonical group on
+// 2026-09-15 (Uuriko/dasha-desk #198); that is a contract change, not a weakening.
 import { OFFICIAL_TG, pinDumpHits, unofficialTelegramHrefs } from './leftover-lobby.test.mjs';
 
 export const MINT = '53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump';

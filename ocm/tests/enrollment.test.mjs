@@ -157,9 +157,12 @@ test('the console mints a code for the signed-in account only, shows it once, an
     const cookie = (signin.headers.get('set-cookie') || '').split(';')[0];
     assert.ok(cookie, 'sign-in issues a session cookie');
 
+    // The form carries the session's CSRF token (P2-9); read it as a browser would.
+    const csrf = (await (await fetch(`${gw.base}/console/`, { headers: { cookie } })).text())
+      .match(/name="csrf" value="([^"]+)"/)[1];
     const page = await fetch(`${gw.base}/console/enroll`, { method: 'POST', redirect: 'manual',
       headers: { 'content-type': 'application/x-www-form-urlencoded', cookie },
-      body: 'label=' + encodeURIComponent('Studio Mac') });
+      body: new URLSearchParams({ csrf, label: 'Studio Mac' }).toString() });
     assert.equal(page.status, 200);
     const body = await page.text();
     const codes = body.match(/ocm_enroll_[-A-Za-z0-9_]{16,}/g) || [];

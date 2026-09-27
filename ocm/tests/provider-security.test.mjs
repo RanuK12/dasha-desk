@@ -82,7 +82,14 @@ test('provider capability claims are bounded and unknown identity fields are dro
     runtime: 'mlx',
     memory_gb: 128,
     build: null,
+    ready: null,
   });
+  // The ready bit is a boolean or absent (null: an agent that predates it). A string
+  // "true" is not a claim the router should act on.
+  assert.equal(normalizeProviderAgent({ id: 'x', models: ['ok'], ready: true }).ready, true);
+  assert.equal(normalizeProviderAgent({ id: 'x', models: ['ok'], ready: false }).ready, false);
+  assert.throws(() => normalizeProviderAgent({ id: 'x', models: ['ok'], ready: 'true' }), /ready must be/);
+  assert.throws(() => normalizeProviderAgent({ id: 'x', models: ['ok'], ready: 1 }), /ready must be/);
   // The build is a SHA-256 of agent.py or nothing; a version string is not accepted.
   const sha = 'a'.repeat(64);
   assert.equal(normalizeProviderAgent({ id: 'x', models: ['ok'], build: sha }).build, sha);

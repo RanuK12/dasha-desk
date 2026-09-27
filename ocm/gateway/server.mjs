@@ -16,16 +16,28 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
 import { createMailer, recoveryMessage, maskEmail } from './mail.mjs';
-import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderDeveloperGuide, renderProfile, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderEnrollment, renderStatus } from './console.mjs';
-import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
+import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderDeveloperGuide, renderProfile, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderRateLimited, renderEnrollment, renderStatus, renderRefused } from './console.mjs';
+import { RateLimiter, clientIp, keyPrefixIdentifier, emailIdentifier } from './ratelimit.mjs';
+import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm, csrfToken, csrfOk } from './session.mjs';
 import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
-import { normalizeProviderAgent } from './provider.mjs';
+import { normalizeProviderAgent, normalizeProviderStatus } from './provider.mjs';
 import { normalizeChatRequest } from './request.mjs';
+import { QuotaReservations } from './quota.mjs';
 import { AGENT_DIR, installSha256, agentSha256, shortBuild, buildState } from './agentfiles.mjs';
 
 // For the few places a secret or host name is interpolated into console HTML outside
 // console.mjs. Secrets are base64url today; escape anyway (review P2-11).
 const escHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/* Operator-facing status of the configured session secret. The 'dev-session-secret'
+   fallback is denylisted in session.mjs, so a missing OCM_SESSION_SECRET silently
+   signs sessions with a per-process key that dies on every restart. This helper
+   exists so the startup path can warn loudly instead of degrading silently; the
+   denylist behavior itself is unchanged. */
+export function sessionSecretStatus(configured) {
+  if (!configured || configured === 'dev-session-secret') return 'placeholder';
+  return 'configured';
+}
 
 const HEARTBEAT_MS = 30_000;
 const HOST_TIMEOUT_MS = 90_000;
@@ -145,6 +157,13 @@ class Registry {
       // Preserve useful cache evidence across an authenticated reconnect by the same
       // account, but never across an account boundary.
       warm: existing ? new Map(existing.warm) : new Map(),
+      // The host's own word on whether its primary model (the first it advertises)
+      // is resident: true, false, or null from an agent that predates the ready bit.
+      // Unlike `warm`, which is evidence we saw ourselves, this is a claim — it moves
+      // routing preference and the status views, never billing or timeouts. Not
+      // carried across a reconnect: every hello says afresh.
+      ready: caps.ready ?? null,
+      primary: (caps.models || [])[0] || null,
       lastSeen: Date.now(),
       connectedAt: Date.now(),
     };
@@ -166,6 +185,15 @@ class Registry {
   /** Is this host known to have the exact wire model loaded right now? */
   isWarm(host, wireModel) { return (host.warm.get(wireModel) || 0) > Date.now() - WARM_TTL_MS; }
 
+  /** Does the host itself say the wire model is resident? Only its primary model can be. */
+  isReady(host, wireModel) { return host.ready === true && host.primary === wireModel; }
+
+  /**
+   * Warm by our evidence or ready by the host's word: either way the next request
+   * should not pay a model load, so both rank the same for routing.
+   */
+  isHot(host, wireModel) { return this.isWarm(host, wireModel) || this.isReady(host, wireModel); }
+
   /**
    * Choose a host for a model.
    *
@@ -180,9 +208,13 @@ class Registry {
    * the next request goes to a cold host, which warms up and then competes on equal
    * terms. Deep queueing is the last resort rather than the default.
    *
-   *   0  warm, under the cap      — fast, and has room
-   *   1  cold, under the cap      — slow once, then it is warm and useful
-   *   2  saturated                — queue only when there is nowhere better
+   *   0  warm or ready, under the cap — fast, and has room
+   *   1  cold, under the cap          — slow once, then it is warm and useful
+   *   2  saturated                    — queue only when there is nowhere better
+   *
+   * "Ready" is the host's own report that it has the model loaded (a preload, or a
+   * job served before we connected to it), which is what lets a machine that has
+   * never served us skip the cold tier without a consumer paying to prove it.
    */
   pick(model, exclude = new Set()) {
     const fresh = Date.now() - HOST_TIMEOUT_MS;
@@ -191,7 +223,7 @@ class Registry {
     if (!candidates.length) return null;
     const rank = (h) => {
       if (h.inflight.size >= MAX_INFLIGHT_PER_HOST) return 2;
-      return this.isWarm(h, this.wireName(h, model)) ? 0 : 1;
+      return this.isHot(h, this.wireName(h, model)) ? 0 : 1;
     };
     candidates.sort((a, b) => rank(a) - rank(b) || a.inflight.size - b.inflight.size);
     return candidates[0];
@@ -228,6 +260,21 @@ const html = (res, code, body) => {
 };
 
 const redirect = (res, location) => { res.writeHead(302, { location }); res.end(); };
+
+/**
+ * 429 for a throttled credential route. One sentence, the same for every caller:
+ * the refusal says nothing about whether the key, code or address it was sent
+ * with is real. `Retry-After` is whole seconds, as the header requires.
+ */
+const rateLimited = (res, retryAfter, { asHtml = false } = {}) => {
+  res.setHeader('retry-after', String(retryAfter));
+  if (asHtml) return html(res, 429, renderRateLimited({ retryAfter }));
+  return json(res, 429, { error: {
+    type: 'rate_limited',
+    message: `too many requests; try again in ${retryAfter}s`,
+    retry_after: retryAfter,
+  } });
+};
 
 const readBody = (req, limit = 2 * 1024 * 1024) => new Promise((resolve, reject) => {
   let size = 0; const parts = [];
@@ -278,7 +325,19 @@ export async function createGateway({
   recoveryEnabled = process.env.OCM_RECOVERY_ENABLED === '1',
   // Tests inject a stub; production builds the SES client on first send.
   mailer = null,
+  // Throttle on the four routes that accept a request with no credential and may
+  // hand one back (review P1-4). The default is the alpha table in ratelimit.mjs;
+  // tests that legitimately hammer those routes pass `null` to switch it off, or a
+  // RateLimiter with a fake clock to prove it.
+  rateLimiter = new RateLimiter(),
+  // How many proxies in front of this process append to X-Forwarded-For. 0 keys the
+  // limiter on the socket peer, which behind the ALB would be the ALB itself and
+  // would throttle everyone together; production sets 1. See clientIp().
+  trustProxy = Number(process.env.OCM_TRUST_PROXY || 0),
 } = {}) {
+  const limiter = rateLimiter || null;
+  // One request against every (rule, key) it names; `ok` when none refused.
+  const throttle = (pairs) => (limiter ? limiter.hitAll(pairs) : { ok: true });
   const mail = mailer || (recoveryEnabled ? createMailer() : null);
   // Constant-time, like every other credential check here (review P2-3).
   const adminOk = (given) => {
@@ -302,6 +361,37 @@ export async function createGateway({
     ledger = new Ledger(ledgerPath);
   }
   await ledger.init();
+  // Worst-case spend is held in memory from the balance check until the job settles,
+  // so concurrent requests cannot all pass the gate on one balance (review P1-1).
+  // Settlement in the ledger stays the source of truth; this only bounds how much
+  // can be in flight at once, per gateway process.
+  const quota = new QuotaReservations();
+
+  // Accounting gate (review P1-3, roadmap R7). The ledgers mark themselves unhealthy
+  // on a write failure, but a request that passed the balance check before that
+  // moment is already in flight; it used to complete as a 200 with a `usage` block
+  // the ledger never recorded. The gateway now keeps its own record of the first
+  // job whose usage could not be written and closes the gate at once: /healthz
+  // reports it (503, so the ALB pulls the target) and every later chat request is
+  // refused before dispatch. Nothing reopens the gate in-process; recovery is a
+  // restart after the ledger is repaired, exactly as for the ledgers' own state.
+  let accountingFailure = null;
+  const accountingFailed = ({ jobId, consumer, host, completionTokens, error }) => {
+    console.error(JSON.stringify({ level: 'error', msg: 'LEDGER WRITE FAILED — accounting gate closed',
+      jobId, consumer, host, completionTokens, error: String(error) }));
+    if (!accountingFailure) accountingFailure = { jobId, at: new Date().toISOString() };
+  };
+  // Public-safe: the ledger's own health is reduced to `ok`, and the gateway adds
+  // only its own job id and timestamp. Field names are additive so /healthz keeps
+  // its shape for anything already reading it.
+  const accountingHealth = () => {
+    const health = publicAccountingHealth(ledger);
+    if (!accountingFailure) return health;
+    return { ...health, ok: false, unrecorded_job: accountingFailure.jobId, closed_at: accountingFailure.at };
+  };
+  const ACCOUNTING_UNAVAILABLE = {
+    error: { type: 'accounting_unavailable', message: 'response produced but usage could not be recorded' },
+  };
 
   // Accounts: Postgres-backed in production, in-memory for tests. Credentials are
   // stored only as SHA-256 hashes and are account-bound and revocable.
@@ -340,7 +430,8 @@ export async function createGateway({
         // A session is only as valid as the credential that opened it: revoking a
         // key must sign out its browser session too, or "revoked" means one thing
         // for the API and something weaker for the console.
-        const claim = readSession(sessionSecret, readCookie(req.headers.cookie));
+        const sessionCookie = readCookie(req.headers.cookie);
+        const claim = readSession(sessionSecret, sessionCookie);
         let account = null;
         if (claim && await accounts.credentialActive(claim.credentialId)) {
           account = await accounts.accountFor(claim.accountId);
@@ -348,10 +439,41 @@ export async function createGateway({
           res.setHeader('set-cookie', clearCookieHeader({ secure: secureCookies }));
         }
 
+        // ---- cross-site request forgery (review P2-9) -------------------------
+        // Two layers. Every console POST is refused when the browser says it came
+        // from another site: `Sec-Fetch-Site: cross-site`, or an `Origin` whose host
+        // is not the one the request arrived on (`Origin: null` counts as foreign).
+        // Absent headers are allowed: nothing in scripts/ or agent/ posts to the
+        // console, but the suite and any operator's curl do, and neither sends
+        // Origin, so this layer guards the pre-session forms (sign-in, sign-up,
+        // recovery) without making them browser-only. Signed-in forms carry a
+        // per-session token as well, checked in each handler below: a request
+        // with a valid cookie but no matching token is refused before it acts.
+        // The /admin/* bearer API is outside this block and unaffected.
+        const csrf = account ? csrfToken(sessionSecret, sessionCookie) : '';
+        // True once the 403 has been written; the caller returns without acting.
+        const refuseCsrf = (f) => {
+          if (csrfOk(sessionSecret, sessionCookie, f.csrf)) return false;
+          html(res, 403, renderRefused({ reason: 'This form was not submitted from your console session. Nothing was changed.' }));
+          return true;
+        };
+        if (req.method === 'POST') {
+          const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+          const origin = req.headers.origin;
+          let foreign = site === 'cross-site';
+          if (!foreign && origin !== undefined) {
+            try { foreign = new URL(origin).host.toLowerCase() !== String(req.headers.host || '').toLowerCase(); }
+            catch { foreign = true; }
+          }
+          if (foreign) {
+            return html(res, 403, renderRefused({ reason: 'This request came from another site. Nothing was changed.' }));
+          }
+        }
+
         if (req.method === 'GET' && consolePath === '/') {
           return account
             ? html(res, 200, await renderDashboard({ registry, ledger, accounts, account, apiHost,
-                admin: isAdmin(account),
+                admin: isAdmin(account), csrf,
                 redeemed: (await ledger.grantCount(account.id)) > 0,
                 inviteRequired: !!inviteCode,
                 notice: url.searchParams.get('notice'),
@@ -382,7 +504,7 @@ export async function createGateway({
           // Readable signed out on purpose: it is the link prospects are sent, it
           // contains no account data, and it is the best recruiting asset we have.
           return html(res, 200, renderProviderGuide({
-            account, apiHost, models: registry.models(), admin: isAdmin(account),
+            account, apiHost, models: registry.models(), admin: isAdmin(account), csrf,
             installHash: await installSha256(),
           }));
         }
@@ -391,7 +513,7 @@ export async function createGateway({
           // The developer counterpart to /provider: the onboarding destination for
           // API consumers. Public for the same reason — no account data on it.
           return html(res, 200, renderDeveloperGuide({
-            account, apiHost, models: registry.models(), admin: isAdmin(account),
+            account, apiHost, models: registry.models(), admin: isAdmin(account), csrf,
           }));
         }
 
@@ -406,6 +528,7 @@ export async function createGateway({
           return html(res, 200, renderProfile({
             account,
             admin: isAdmin(account),
+            csrf,
             profile: {
               emailVerifiedAt: account.email_verified_at || null,
               createdAt: account.created_at || null,
@@ -431,11 +554,15 @@ export async function createGateway({
         // rather than a hint that the page exists.
         if (req.method === 'GET' && consolePath === '/network') {
           if (!isAdmin(account)) return redirect(res, '/');
-          return html(res, 200, await renderNetwork({ registry, ledger, accounts, account }));
+          return html(res, 200, await renderNetwork({ registry, ledger, accounts, account, csrf,
+            all: url.searchParams.get('all') === '1' }));
         }
 
         if (req.method === 'POST' && consolePath === '/signup') {
           const f = parseForm(await readBody(req));
+          // Before any lookup, so the refusal carries no information about the address.
+          const rl = throttle([['signup_ip', clientIp(req, trustProxy)]]);
+          if (!rl.ok) return rateLimited(res, rl.retryAfter, { asHtml: true });
           if (!f.email) return redirect(res, '/?error=' + encodeURIComponent('An email address is required.'));
           // Signup must NEVER authenticate an existing email. Accounts are keyed by
           // email, so without this an unauthenticated visitor who types someone
@@ -502,6 +629,11 @@ needs no invite code: your machine earns credits as it serves. See
         }
         if (req.method === 'POST' && consolePath === '/recover') {
           const f = parseForm(await readBody(req));
+          // Per address and per submitted email, counted before the account lookup and
+          // whether or not the address has an account, so a 429 is not an oracle.
+          const rl = throttle([['recover_ip', clientIp(req, trustProxy)],
+                               ['recover_email', emailIdentifier(f.email)]]);
+          if (!rl.ok) return rateLimited(res, rl.retryAfter, { asHtml: true });
           let email = null;
           try { email = normalizeEmail(f.email); } catch { email = null; }
           const acct = email ? await accounts.accountByEmail(email) : null;
@@ -545,6 +677,12 @@ You are signed in with this one.</p>`,
 
         if (req.method === 'POST' && consolePath === '/signin') {
           const f = parseForm(await readBody(req));
+          // Per address and per key prefix, before the lookup: a guess spread across
+          // many addresses still shares one bucket per target, and the 429 is the
+          // same whether or not the key is real.
+          const rl = throttle([['signin_ip', clientIp(req, trustProxy)],
+                               ['signin_key', keyPrefixIdentifier(f.key)]]);
+          if (!rl.ok) return rateLimited(res, rl.retryAfter, { asHtml: true });
           const found = await accounts.resolve(f.key, 'developer_key');
           if (!found) return redirect(res, '/?error=' + encodeURIComponent('That key is not valid, or has been revoked.'));
           res.setHeader('set-cookie',
@@ -553,6 +691,10 @@ You are signed in with this one.</p>`,
         }
 
         if (req.method === 'POST' && consolePath === '/signout') {
+          // A live session signs out only with its token, so another site cannot
+          // log someone out. Without a session there is nothing to protect: just
+          // clear whatever cookie was sent.
+          if (account && refuseCsrf(parseForm(await readBody(req)))) return;
           res.setHeader('set-cookie', clearCookieHeader({ secure: secureCookies }));
           return redirect(res, '/');
         }
@@ -560,6 +702,7 @@ You are signed in with this one.</p>`,
         if (req.method === 'POST' && consolePath === '/redeem') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           const offered = (f.invite || '').trim();
           if (!offered) return redirect(res, '/?error=' + encodeURIComponent('Enter an invite code.'));
           if (!inviteCode || offered !== inviteCode) {
@@ -578,6 +721,7 @@ You are signed in with this one.</p>`,
         if (req.method === 'POST' && consolePath === '/keys/new') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           const kind = f.kind === 'provider_token' ? 'provider_token' : 'developer_key';
           const cred = await accounts.issue(account.id, kind, f.label || null);
           const isProvider = kind === 'provider_token';
@@ -609,6 +753,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         if (req.method === 'POST' && consolePath === '/enroll') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           const label = (f.label || '').slice(0, 64) || null;
           const enr = await accounts.issueEnrollment(account.id, label);
           // Same slug rule as /keys/new: [a-z0-9-] only, so it cannot break out of quotes.
@@ -620,6 +765,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         if (req.method === 'POST' && consolePath === '/keys/rebind') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           // Scoped to the signed-in account, so one person cannot free another's token.
           const ok = await accounts.rebind(f.credential_id, account.id);
           return redirect(res, '/?notice=' + encodeURIComponent(ok
@@ -630,6 +776,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         if (req.method === 'POST' && consolePath === '/keys/revoke') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
+          if (refuseCsrf(f)) return;
           const creds = await accounts.listCredentials(account.id);
           // Only ever revoke a credential the signed-in account actually owns.
           if (!creds.some((c) => c.id === f.credential_id)) return redirect(res, '/');
@@ -718,7 +865,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         }
       }
       if (req.method === 'GET' && url.pathname === '/healthz') {
-        const accounting = publicAccountingHealth(ledger);
+        const accounting = accountingHealth();
         return json(res, accounting.ok ? 200 : 503, {
           ok: accounting.ok,
           service: 'ocm-gateway',
@@ -764,8 +911,13 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
       // used and expired are one answer on purpose (no oracle). The token appears in
       // this response and nowhere else, ever.
       if (req.method === 'POST' && url.pathname === '/v1/provider/enroll') {
+        const raw = await readBody(req);
+        // Per address, before the code is even parsed: the JSON error would
+        // otherwise be a free request.
+        const rl = throttle([['enroll_ip', clientIp(req, trustProxy)]]);
+        if (!rl.ok) return rateLimited(res, rl.retryAfter);
         let body;
-        try { body = JSON.parse(await readBody(req) || '{}'); }
+        try { body = JSON.parse(raw || '{}'); }
         catch { return apiError(res, 400, 'body must be JSON'); }
         const code = typeof body.code === 'string' ? body.code : '';
         const agentId = typeof body.agent_id === 'string' ? body.agent_id : '';
@@ -796,8 +948,11 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
             // `unreported` both mean `ocm-agent-update` is due; no account identity.
             build: shortBuild(h.caps.build), build_state: buildState(h.caps.build, served),
             // Public, and carries no account identity: whether this host will answer
-            // in about a second or has to load a model first.
+            // in about a second or has to load a model first. `warm` is what we saw
+            // (a first chunk); `ready` is what the host says (true/false), or null
+            // from an agent that predates the ready bit.
             warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
+            ready: h.ready,
             inflight: h.inflight.size, uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
           })),
           models: registry.models(),
@@ -834,11 +989,11 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
     const key = bearer(req);
     const consumer = await resolveConsumer(key);
     if (!consumer) return apiError(res, 401, 'invalid api key', 'authentication_error');
-    if ((await ledger.balance(consumer)) <= 0) {
-      const fresh = (await ledger.grantCount(consumer)) === 0;
-      return apiError(res, 402, fresh
-        ? `this account has no granted balance — redeem an invite code at https://${consoleHost}`
-        : 'balance exhausted', 'insufficient_quota');
+    // Fail closed before dispatch once any usage has gone unrecorded (or the ledger
+    // itself is unhealthy): an honest 503 here, not a generic 500 from balance().
+    if (!accountingHealth().ok) {
+      return apiError(res, 503, 'accounting is unavailable; requests are refused until the gateway recovers',
+        'accounting_unavailable');
     }
 
     let body;
@@ -868,6 +1023,34 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
     }
 
     const promptTokens = countTokens(messages.map((m) => m?.content || '').join('\n'));
+
+    // Reserve the worst case this request can cost (prompt + the clamped completion
+    // budget) against the balance minus what other in-flight requests already hold.
+    // One balance read, then the hold is installed synchronously, so N concurrent
+    // requests against a balance that covers one admit exactly one (review P1-1).
+    const hold = await quota.reserve(consumer, promptTokens + maxTokens, () => ledger.balance(consumer));
+    if (!hold.ok) {
+      if (hold.balance <= 0) {
+        const fresh = (await ledger.grantCount(consumer)) === 0;
+        return apiError(res, 402, fresh
+          ? `this account has no granted balance — redeem an invite code at https://${consoleHost}`
+          : 'balance exhausted', 'insufficient_quota');
+      }
+      return apiError(res, 402, `insufficient balance for this request: ${hold.required} tokens `
+        + `(prompt + max_tokens) needed, ${hold.available} available after in-flight requests`,
+        'insufficient_quota');
+    }
+    try {
+      await dispatch({ res, model, served, substituted, messages, maxTokens, stream, consumer, promptTokens });
+    } finally {
+      // Every way a job can end resolves runJob, so this runs exactly once per
+      // request; the ledger, not the hold, records what was actually used.
+      hold.release();
+    }
+  }
+
+  /** Route one reserved request: pick a host, run it, fail over before first byte. */
+  async function dispatch({ res, model, served, substituted, messages, maxTokens, stream, consumer, promptTokens }) {
     const jobId = randomUUID();
     const created = Math.floor(Date.now() / 1000);
     const chatId = `chatcmpl-${jobId.slice(0, 12)}`;
@@ -936,39 +1119,76 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
       };
 
       // Bill only what reached the client, and only ever the gateway's own count.
-      // The ledgers are idempotent by jobId and mark accounting unhealthy on a
-      // write/database failure, which makes subsequent balance checks fail closed.
+      // The ledgers are idempotent by jobId. If the write fails this closes the
+      // gateway's accounting gate and THROWS: every caller below decides what the
+      // client is told, and none of them may report success (review P1-3, R7).
+      // Settlement is claimed exactly once per job, so clear is attempted at most
+      // once; a failed attempt is never retried here, and a client retry is a new
+      // job with a new id, so nothing can double-debit or double-credit.
       const meter = async () => {
         const completionTokens = countTokens(text);
         try {
           await ledger.clear({ consumer, host: host.id, model, promptTokens, completionTokens, jobId });
         } catch (err) {
-          console.error(JSON.stringify({ level: 'error', msg: 'LEDGER WRITE FAILED — accounting disabled',
-            jobId, consumer, host: host.id, completionTokens, error: String(err) }));
+          accountingFailed({ jobId, consumer, host: host.id, completionTokens, error: err });
+          throw err;
         }
         return completionTokens;
       };
 
-      const onClientGone = () => {
-        if (state !== 'open') return;
-        host.conn.sendJson({ t: 'cancel', id: jobId });
-        const wasCommitted = committed;
-        if (!claimSettlement()) return;
-        if (!wasCommitted) return finish({ ok: false, committed: false, aborted: true });
-        void meter().finally(() => finish({ ok: false, committed: true, aborted: true }));
+      // A response was produced but its usage could not be recorded. The generated
+      // text is DROPPED: the consumer is not charged, the provider is not credited,
+      // and the client is not handed an unaccounted completion as a 200. Nothing has
+      // shipped for a non-stream request (or a stream that never got a chunk), so it
+      // gets a plain 503 in the usual error envelope. Bytes already written to a
+      // stream cannot be unsent; the honest move left is to withhold [DONE] and end
+      // with an SSE `error` event carrying the same envelope, so a well-behaved
+      // client knows the completion is unaccounted rather than complete.
+      const unaccounted = () => {
+        try {
+          if (committed) {
+            res.write(`event: error\ndata: ${JSON.stringify(ACCOUNTING_UNAVAILABLE)}\n\n`);
+            res.end();
+          } else {
+            committed = true;
+            json(res, 503, ACCOUNTING_UNAVAILABLE);
+          }
+        } catch {}
+        finish({ ok: false, committed: true, unaccounted: true });
       };
 
-      const timer = setTimeout(() => {
+      // Cancelling — because the client went away or the job timed out — frees this
+      // host's routing slot NOW, by claiming settlement, and bills exactly what had
+      // reached the client. It never waits on the host. An agent may answer the
+      // cancel with a terminal frame (R4 agents send `error: cancelled`), answer
+      // late, or never answer (older agents); by then the job is gone from
+      // `inflight`, so the socket handler drops whatever arrives without touching
+      // the slot count or the ledger (tests/cancel.test.mjs). With two slots per
+      // host, holding one until the job timeout would take half a machine out of
+      // service per abandoned request. A timeout differs from a departed client in
+      // that there is still a response to end, so a metering failure is reported
+      // to it via `unaccounted`; a departed client has nobody left to tell, and
+      // meter() has already closed the gate. A pre-token timeout may be retried on
+      // another host.
+      const cancel = ({ aborted }) => {
         if (state !== 'open') return;
         host.conn.sendJson({ t: 'cancel', id: jobId });
         const wasCommitted = committed;
         if (!claimSettlement()) return;
-        if (!wasCommitted) return finish({ ok: false, committed: false });
-        void meter().finally(() => {
+        if (!wasCommitted) return finish({ ok: false, committed: false, aborted });
+        if (aborted) {
+          void meter().catch(() => {}).finally(() => finish({ ok: false, committed: true, aborted: true }));
+          return;
+        }
+        meter().then(() => {
           try { res.end(); } catch {}
-          finish({ ok: false, committed: true });
-        });
-      }, registry.isWarm(host, wireModel) ? JOB_TIMEOUT_MS : COLD_JOB_TIMEOUT_MS);
+          finish({ ok: false, committed: true, aborted: false });
+        }, unaccounted);
+      };
+      const onClientGone = () => cancel({ aborted: true });
+
+      const timer = setTimeout(() => cancel({ aborted: false }),
+        registry.isWarm(host, wireModel) ? JOB_TIMEOUT_MS : COLD_JOB_TIMEOUT_MS);
 
       host.inflight.set(jobId, {
         onChunk(delta) {
@@ -1004,21 +1224,23 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         },
         async onDone() {
           if (!claimSettlement()) return;
+          // Record first, then answer: a 200 (or [DONE]) is a claim that the usage
+          // it reports exists in the ledger, so it cannot be written before it does.
+          let completionTokens;
+          try { completionTokens = await meter(); }
+          catch { return unaccounted(); }
           if (stream) {
             if (!committed) {
               committed = true;
               res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
             }
-            const completionTokens = await meter();
             res.write(`data: ${JSON.stringify({
               id: chatId, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
             })}\n\n`);
             res.write('data: [DONE]\n\n');
             res.end();
-            void completionTokens;
           } else {
-            const completionTokens = await meter();
             committed = true;
             json(res, 200, {
               id: chatId, object: 'chat.completion', created, model,
@@ -1033,8 +1255,9 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
           const wasCommitted = committed;
           if (!claimSettlement()) return;
           if (wasCommitted) {
-            // Mid-stream failure: close the stream cleanly and bill what shipped.
-            await meter();
+            // Mid-stream failure: bill what shipped, then close the stream cleanly.
+            try { await meter(); }
+            catch { return unaccounted(); }
             if (stream) { res.write('data: [DONE]\n\n'); res.end(); }
             finish({ ok: false, committed: true });
           } else {
@@ -1171,6 +1394,20 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
         return;
       }
       host.lastSeen = Date.now();
+      if (msg.t === 'status') {
+        // Residency changed on the host: it loaded its primary model, or lost it.
+        // A claim, so it moves routing preference and the status views only.
+        let status;
+        try { status = normalizeProviderStatus(msg); }
+        catch { conn.close(1008, 'invalid provider status'); return; }
+        host.ready = status.ready;
+        return;
+      }
+      // A frame for a job no longer in `inflight` — cancelled, timed out, or already
+      // settled — is dropped here, after counting as liveness. That is what lets a
+      // cancel free the slot without waiting for the host, and what makes a late
+      // `error: cancelled` from an R4 agent (or a stray `done` after it) harmless:
+      // the slot cannot be freed twice and the ledger is never touched again.
       const job = msg.id && host.inflight.get(msg.id);
       if (msg.t === 'chunk') {
         if (typeof msg.delta !== 'string') {
@@ -1241,7 +1478,7 @@ export OPENAI_API_KEY="${escHtml(cred.secret)}"</pre>`,
     server.close(resolve);
   });
 
-  return { server, registry, ledger, accounts, close, consumers, resolveConsumer };
+  return { server, registry, ledger, accounts, quota, close, consumers, resolveConsumer };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -1249,6 +1486,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   // Binds loopback by default so a local run is not exposed; the deployed unit sets
   // HOST=0.0.0.0 because the ALB health-checks and proxies over the VPC network.
   const host = process.env.HOST || '127.0.0.1';
+  /* Loud, not silent: with no real OCM_SESSION_SECRET the gateway signs console
+     sessions with a per-process key and every user is logged out on restart. */
+  if (sessionSecretStatus(process.env.OCM_SESSION_SECRET) === 'placeholder') {
+    const banner = '='.repeat(72);
+    console.warn(`\n${banner}`);
+    console.warn('WARNING: OCM_SESSION_SECRET is not set to a real secret.');
+    console.warn('Console sessions are signed with an ephemeral per-process key and');
+    console.warn('will DIE on every gateway restart. Set OCM_SESSION_SECRET to a long');
+    console.warn('random value in production before real users sign in.');
+    console.warn(`${banner}\n`);
+  }
   const { server } = await createGateway();
   server.listen(port, host, () => {
     console.log(JSON.stringify({ ok: true, service: 'ocm-gateway', url: `http://${host}:${port}` }));
