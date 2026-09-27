@@ -29,6 +29,16 @@ import { AGENT_DIR, installSha256, agentSha256, shortBuild, buildState } from '.
 // console.mjs. Secrets are base64url today; escape anyway (review P2-11).
 const escHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+/* Operator-facing status of the configured session secret. The 'dev-session-secret'
+   fallback is denylisted in session.mjs, so a missing OCM_SESSION_SECRET silently
+   signs sessions with a per-process key that dies on every restart. This helper
+   exists so the startup path can warn loudly instead of degrading silently; the
+   denylist behavior itself is unchanged. */
+export function sessionSecretStatus(configured) {
+  if (!configured || configured === 'dev-session-secret') return 'placeholder';
+  return 'configured';
+}
+
 const HEARTBEAT_MS = 30_000;
 const HOST_TIMEOUT_MS = 90_000;
 const JOB_TIMEOUT_MS = 120_000;
@@ -1476,6 +1486,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   // Binds loopback by default so a local run is not exposed; the deployed unit sets
   // HOST=0.0.0.0 because the ALB health-checks and proxies over the VPC network.
   const host = process.env.HOST || '127.0.0.1';
+  /* Loud, not silent: with no real OCM_SESSION_SECRET the gateway signs console
+     sessions with a per-process key and every user is logged out on restart. */
+  if (sessionSecretStatus(process.env.OCM_SESSION_SECRET) === 'placeholder') {
+    const banner = '='.repeat(72);
+    console.warn(`\n${banner}`);
+    console.warn('WARNING: OCM_SESSION_SECRET is not set to a real secret.');
+    console.warn('Console sessions are signed with an ephemeral per-process key and');
+    console.warn('will DIE on every gateway restart. Set OCM_SESSION_SECRET to a long');
+    console.warn('random value in production before real users sign in.');
+    console.warn(`${banner}\n`);
+  }
   const { server } = await createGateway();
   server.listen(port, host, () => {
     console.log(JSON.stringify({ ok: true, service: 'ocm-gateway', url: `http://${host}:${port}` }));
