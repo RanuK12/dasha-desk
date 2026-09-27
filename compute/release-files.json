@@ -1,5 +1,6 @@
 [
   ".env.example",
+  "ADD-A-MODEL.md",
   "LICENSE",
   "PROVENANCE.md",
   "README.md",
@@ -20,6 +21,7 @@
   "examples/chat.py",
   "index.html",
   "install.sh",
+  "mcp-tool-catalog.json",
   "package.json",
   "pnpm-lock.yaml",
   "provider/agent.py",
@@ -29,7 +31,10 @@
   "release-files.json",
   "scripts/build-release.mjs",
   "tests/auth-boundaries.test.mjs",
+  "tests/doctor-checks.test.mjs",
+  "tests/doctor-remaining-checks.test.mjs",
   "tests/e2e.test.mjs",
+  "tests/mcp-tool-catalog.test.mjs",
   "tests/openrouter-provider.test.mjs",
   "tests/provider-key.test.mjs",
   "tests/release.test.mjs"
