@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   id-token: write
   attestations: write
 
@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
@@ -52,20 +52,15 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: compute/dist/dasha-compute-open-alpha.tar.gz
-      - name: Publish archive for the edge Worker
+      - name: Record reviewed promotion handoff
         if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          mkdir -p artifacts/dasha-compute
-          cp compute/dist/dasha-compute-open-alpha.tar.gz \
-             compute/dist/dasha-compute-open-alpha.tar.gz.sha256 \
-             compute/dist/release.json \
-             artifacts/dasha-compute/
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add artifacts/dasha-compute
-          if git diff --cached --quiet; then
-            echo "artifacts unchanged"
-            exit 0
-          fi
-          git commit -m "Publish Compute provenance archive for edge download"
-          git push
+          {
+            echo "## Compute archive ready for review"
+            echo "Source commit: $SOURCE_SHA"
+            echo "Download the dasha-compute-open-alpha-$SOURCE_SHA artifact from this run."
+            echo "Promote its three files through an ordinary PR into artifacts/dasha-compute/."
+            echo "Follow docs/COMPUTE-RELEASE.md; merging source or archive files does not deploy the public download."
+          } >> "$GITHUB_STEP_SUMMARY"
