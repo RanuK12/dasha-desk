@@ -875,12 +875,19 @@
     try {
       var ghStatus = await fetchJson(GITHUB_OAUTH_STATUS, impl, cred);
       live.githubConfigured = !!(ghStatus.data && ghStatus.data.configured === true);
+      // Live connect state from the lobby endpoint: available when the lobby
+      // reports GitHub OAuth configured, unavailable otherwise (and on error,
+      // so the button never shows a stale placeholder).
+      live.githubStatus = live.githubConfigured ? 'available' : 'unavailable';
       if (ghStatus.data && (ghStatus.data.github || ghStatus.data.gh || ghStatus.data.user)) {
         ident = mergeIdentity(ident, {
           github: ghStatus.data.github || ghStatus.data.gh || ghStatus.data.user,
         });
       }
-    } catch (e) {}
+    } catch (e) {
+      live.githubConfigured = false;
+      live.githubStatus = 'unavailable';
+    }
     return ident;
   }
 
@@ -1224,11 +1231,17 @@
     }
   }
 
+  // Live GitHub connect states from the lobby /oauth/github/status endpoint.
+  // There is no dead placeholder: loading, available (click to connect), and
+  // unavailable each get honest copy, and the click handler honors the same
+  // states so the button never opens a popup that cannot work.
   function githubCtaLabel(configured, profile) {
     if (profile && (profile.login || profile.handle)) {
       return String(profile.login || profile.handle);
     }
-    return configured ? 'GitHub' : 'GitHub soon';
+    if (live.githubStatus === 'unavailable') return 'GitHub unavailable';
+    if (configured || live.githubStatus === 'available') return 'Connect GitHub';
+    return 'GitHub…';
   }
 
   function faceButton(el, profile, kind) {
@@ -1236,8 +1249,9 @@
     if (!profile) {
       el.className = kind === 'x' ? 'bb-id-btn bb-id-x' : 'bb-id-btn';
       var label = kind === 'x' ? 'X' : githubCtaLabel(live.githubConfigured);
-      el.innerHTML = label;
-      el.setAttribute('aria-label', label);
+      var badge = kind === 'x' ? '<span class="bb-id-badge">optional</span>' : '';
+      el.innerHTML = label + badge;
+      el.setAttribute('aria-label', kind === 'x' ? 'X (optional)' : label);
       return;
     }
     var label = kind === 'x' ? profile.display || '@' + profile.handle : profile.login;
@@ -1245,9 +1259,10 @@
     var img = profile.avatar
       ? '<img src="' + esc(profile.avatar) + '" alt="" width="36" height="36"/>'
       : '';
+    var badge = kind === 'x' ? '<span class="bb-id-badge">optional</span>' : '';
     el.className = kind === 'x' ? 'bb-id-face bb-id-x' : 'bb-id-face';
-    el.innerHTML = img + esc(label);
-    el.setAttribute('aria-label', label);
+    el.innerHTML = img + esc(label) + badge;
+    el.setAttribute('aria-label', kind === 'x' ? label + ' (optional)' : label);
     el.dataset.href = href;
   }
 
@@ -1280,6 +1295,10 @@
       ghBtn.addEventListener('click', function () {
         if (live.identity && live.identity.github && ghBtn.dataset.href) {
           window.open(ghBtn.dataset.href, '_blank', 'noopener,noreferrer');
+          return;
+        }
+        if (live.githubStatus === 'unavailable') {
+          toast('GitHub connect is unavailable right now');
           return;
         }
         var w = openOauthPopup(GITHUB_OAUTH_START, GITHUB_OAUTH_WINDOW);
@@ -1393,6 +1412,7 @@
     demigod: [],
     identity: emptyIdentity(),
     githubConfigured: false,
+    githubStatus: 'loading',
     filter: 'all',
   };
 

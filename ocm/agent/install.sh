@@ -324,12 +324,14 @@ if [ "$DRY_RUN" = 1 ]; then
   else
     DAEMON="not loaded; it would be created and started"
   fi
+  # --- model cache (begin)
   HUB="$RUN_HOME/.cache/huggingface/hub/models--$(printf '%s' "$MLX_MODEL" | sed 's|/|--|g')"
   if [ -d "$HUB" ]; then
     CACHE="present, $(du -sh "$HUB" 2>/dev/null | cut -f1); the installer does not touch it"
   else
     CACHE="absent; about 4.5 GB downloads on the first request, not during install"
   fi
+  # --- model cache (end)
   # The build the gateway would install is the first twelve characters of the checksum
   # it publishes for agent.py; the real run refuses a download that does not match it.
   SERVED=$(curl_https --fail "$SOURCE/agent.py.sha256" 2>/dev/null | cut -c1-12)
