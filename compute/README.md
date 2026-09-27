@@ -36,7 +36,9 @@ DASHA_MODEL_MAP=qwen3-8b=qwen3:8b \
 ./install.sh
 ```
 
-`./install.sh --help` prints the same handoff. The prompt refuses an existing file or a terminal that cannot hide input. `DASHA_PROVIDER_KEY_FILE` overrides the default `.dasha-provider-key` path for both the prompt and installer; set it consistently. The file stays available if validation, connection checks, or the Keychain write fail. The one-time macOS Keychain write still passes the token to `security -w`; this change does not remove that existing process-argument limitation. Manage the service with:
+`./install.sh --help` prints the same handoff. The prompt refuses an existing file or a terminal that cannot hide input. `DASHA_PROVIDER_KEY_FILE` overrides the default `.dasha-provider-key` path for both the prompt and installer; set it consistently. The file stays available if validation, connection checks, or the Keychain write fail. The one-time macOS Keychain write still passes the token to `security -w`; this change does not remove that existing process-argument limitation.
+
+Choosing which models to advertise: see the [Apple Silicon model catalog by memory tier](../docs/APPLE-SILICON-MODEL-CATALOG.md) to pick 4-bit models that fit your Mac's unified memory, then extend `DASHA_MODEL_MAP` above accordingly. Manage the service with:
 
 ```bash
 dasha-compute status
