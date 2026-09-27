@@ -197,6 +197,8 @@ test("macOS installer rejects shell syntax in coordinator URLs", async (context)
 });
 
 test("provider doctor fails when a configured Ollama model is missing", async (context) => {
+  const testHome = await mkdtemp(join(tmpdir(), "dasha-doctor-isolated-"));
+  context.after(() => rm(testHome, { recursive: true, force: true }));
   const port = await freePort();
   const server = http.createServer((request, response) => {
     response.setHeader("Content-Type", "application/json");
@@ -206,7 +208,7 @@ test("provider doctor fails when a configured Ollama model is missing", async (c
   context.after(() => server.close());
   const child = spawn(python, ["provider/agent.py", "--doctor"], {
     cwd: new URL("..", import.meta.url),
-    env: { ...process.env, DASHA_COORDINATOR_URL: `http://127.0.0.1:${port}`, OLLAMA_URL: `http://127.0.0.1:${port}`, DASHA_MODEL_MAP: "qwen3-8b=qwen3:8b" },
+    env: { ...process.env, HOME: testHome, DASHA_COORDINATOR_URL: `http://127.0.0.1:${port}`, OLLAMA_URL: `http://127.0.0.1:${port}`, DASHA_MODEL_MAP: "qwen3-8b=qwen3:8b", DASHA_DOCTOR_TEST_PLATFORM: "Darwin:arm64:15.0" },
   });
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr += chunk; });
@@ -393,4 +395,17 @@ test("relays provider deltas as OpenAI-compatible SSE", async (context) => {
   assert.match(events, /"content":"from the edge"/);
   assert.match(events, /"finish_reason":"stop"/);
   assert.match(events, /data: \[DONE\]/);
+});
+
+
+test("installed doctor command consumes its subcommand and forwards options", async () => {
+  const wrapper = await readFile(new URL("../provider/dasha-compute", import.meta.url), "utf8");
+  const dispatch = wrapper.slice(wrapper.indexOf('case "${1:-status}" in'));
+  assert.ok(dispatch.startsWith("case "));
+  // Exercise the actual shell dispatch without reading the operator's Keychain.
+  const harness = 'set -eu\nrun_agent() { printf "%s\\n" "$@"; }\n' + dispatch;
+  for (const options of [[], ["--json"]]) {
+    const output = execFileSync("sh", ["-c", harness, "dasha-compute", "doctor", ...options], { encoding: "utf8" });
+    assert.deepEqual(output.trim().split("\n"), ["--doctor", ...options]);
+  }
 });
