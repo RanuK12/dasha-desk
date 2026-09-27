@@ -215,3 +215,39 @@ test("a job with no provider times out as 503 with a retry hint", async (context
   assert.match((await response.json()).error.type, /provider_unavailable/);
   assert.ok(Date.now() - started >= 4000, "should wait for the job timeout");
 });
+
+/* A coordinator bound to a non-loopback interface with the public default keys
+   would expose the consumer/provider APIs to the network with guessable
+   credentials. It must refuse to start; loopback keeps the convenient
+   defaults for local development. */
+test("coordinator refuses a non-loopback bind with default keys", async () => {
+  const child = spawn(process.execPath, ["coordinator/server.mjs"], {
+    cwd: new URL("..", import.meta.url),
+    env: { ...process.env, PORT: "0", HOST: "0.0.0.0", JOB_TIMEOUT_MS: "5000" },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+  const code = await new Promise((resolve) => {
+    const timer = setTimeout(() => { child.kill("SIGKILL"); resolve("timeout"); }, 15_000);
+    child.on("exit", (c) => { clearTimeout(timer); resolve(c); });
+  });
+  assert.equal(code, 1, "coordinator started on 0.0.0.0 with default keys");
+  assert.match(stderr, /not loopback/, "refusal reason names the non-loopback bind");
+});
+
+test("coordinator starts on a non-loopback bind with real keys", async (context) => {
+  const base = await spawnCoordinator(context, {
+    HOST: "0.0.0.0",
+    DASHA_API_KEY: "real-consumer-key",
+    DASHA_PROVIDER_KEY: "real-provider-key",
+  });
+  const response = await fetch(`${base}/healthz`);
+  assert.equal(response.status, 200);
+});
+
+test("coordinator keeps default keys on the loopback bind", async (context) => {
+  const base = await spawnCoordinator(context); // no HOST, no keys: 127.0.0.1 + defaults
+  const response = await fetch(`${base}/healthz`);
+  assert.equal(response.status, 200);
+});
