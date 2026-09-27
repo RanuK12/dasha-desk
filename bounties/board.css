@@ -68,6 +68,13 @@ html,body{margin:0;padding:0;background:var(--ink);color:var(--paper);min-height
   box-shadow:4px 4px 0 var(--hot);min-width:72px;padding:0 18px;
 }
 .bb-id-btn.bb-id-x:hover{box-shadow:1px 1px 0 var(--hot)}
+/* "optional" badge on the X identity button: X is nice-to-have, GitHub is required. */
+.bb-id-badge{
+  display:inline-block;font-size:11px;line-height:1;letter-spacing:.08em;
+  padding:3px 7px;border:1px solid currentColor;border-radius:999px;
+  opacity:.8;vertical-align:middle;margin-left:8px;text-transform:uppercase;
+}
+.bb-id-face .bb-id-badge{border-color:var(--line);opacity:.7;margin-left:0}
 .bb-id-face{
   appearance:none;cursor:pointer;font:inherit;font-weight:900;
   display:inline-flex;align-items:center;gap:8px;
