@@ -33,8 +33,14 @@ assert.match(html, /id="bb-item"/);
 assert.match(html, /id="bb-payto"/);
 assert.match(html, /id="bb-github"/);
 assert.match(html, /id="bb-x"/);
-assert.match(html, />X</);
-assert.match(html, />GitHub soon</);
+assert.match(html, /bb-id-badge/);
+assert.match(html, />optional</);
+assert.match(html, /aria-label="X \(optional\)"/);
+assert.match(css, /\.bb-id-badge/);
+assert.doesNotMatch(copy, /GitHub soon/, 'the dead "GitHub soon" placeholder is gone everywhere');
+assert.match(js, /live\.githubStatus/);
+assert.match(js, /'Connect GitHub'/);
+assert.match(js, /'GitHub unavailable'/);
 assert.match(html, /href="https:\/\/lobby\.getdasha\.com\/oauth\/github\/start"/);
 assert.match(html, /href="https:\/\/lobby\.getdasha\.com\/oauth\/x\/start"/);
 assert.doesNotMatch(html, /href="https:\/\/www\.getdasha\.com\/studio"/);
@@ -46,9 +52,45 @@ assert.match(html, /id="bb-payto"[^>]*required/);
 assert.match(html, /id="bb-amount"[^>]*required/);
 assert.doesNotMatch(html, /href="\/studio"/);
 assert.doesNotMatch(html, /href="\/bounties\/"/);
-assert.equal(B.githubCtaLabel(false), 'GitHub soon');
-assert.equal(B.githubCtaLabel(true), 'GitHub');
+assert.equal(B.githubCtaLabel(false), 'GitHub…', 'loading state before the lobby answers');
+assert.equal(B.githubCtaLabel(true), 'Connect GitHub');
 assert.equal(B.githubCtaLabel(false, { login: 'Uuriko' }), 'Uuriko');
+
+// Live GitHub connect states come from the lobby /oauth/github/status endpoint,
+// exercised through loadLobbyIdentity with a stubbed fetch.
+{
+  const configured = async (url) => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify(url.includes('github/status') ? { configured: true } : {}),
+  });
+  await B.loadLobbyIdentity(configured);
+  assert.equal(B.githubCtaLabel(false), 'Connect GitHub', 'lobby says OAuth available');
+}
+{
+  const down = async (url) => {
+    if (url.includes('github/status')) throw new Error('lobby down');
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  await B.loadLobbyIdentity(down);
+  assert.equal(B.githubCtaLabel(false), 'GitHub unavailable', 'lobby unreachable');
+}
+{
+  const notConfigured = async () => ({ ok: true, status: 200, text: async () => '{}' });
+  await B.loadLobbyIdentity(notConfigured);
+  assert.equal(B.githubCtaLabel(false), 'GitHub unavailable', 'lobby says not configured');
+}
+{
+  const withProfile = async (url) => ({
+    ok: true,
+    status: 200,
+    text: async () =>
+      JSON.stringify(url.includes('github/status') ? { configured: true, github: { login: 'Uuriko' } } : {}),
+  });
+  const ident = await B.loadLobbyIdentity(withProfile);
+  assert.equal(ident.github.login, 'Uuriko');
+  assert.equal(B.githubCtaLabel(false, ident.github), 'Uuriko', 'connected profile wins');
+}
 assert.match(html, /We don't hold it\./);
 assert.match(html, /rel="alternate"[^>]*feed\.json/);
 assert.doesNotMatch(copy, /[1-9A-HJ-NP-Za-km-z]{32,44}pump/);
@@ -645,7 +687,7 @@ const bootedGhLive = await B.boot({
   storage: mem,
 });
 assert.equal(bootedGhLive.githubConfigured, true);
-assert.equal(B.githubCtaLabel(bootedGhLive.githubConfigured), 'GitHub');
+assert.equal(B.githubCtaLabel(bootedGhLive.githubConfigured), 'Connect GitHub');
 
 const bootedEmpty = await B.boot({
   fetchImpl: fakeBoardFetch({ name: 'demigod bounties', listings: [] }),
