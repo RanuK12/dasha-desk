@@ -16,7 +16,7 @@ function generateBreakpoint2026Ticket() {
       "tag `@SolanaEvents` and `@SuperteamDE`",
       "quote-retweet the sponsor's announcement with a thoughtful comment",
       "submit both URLs through Superteam Earn",
-      "video is favored"
+      "video is favored: 1-3 minute original video showcasing machine-paid inference capabilities with clear technical demonstrations"
     ],
     reward: "$800 ticket code (not cash, no travel)"
   };
