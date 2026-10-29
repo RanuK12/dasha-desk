@@ -1,0 +1,71 @@
+<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="400" height="300" fill="#f8f9fa"/>
+  
+  <!-- Title -->
+  <text x="200" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#1a1a2e">
+    Cap → Stream → Settle
+  </text>
+  
+  <!-- CAP Box -->
+  <g transform="translate(50, 60)">
+    <rect width="100" height="60" rx="8" fill="#00d4ff" stroke="#0099cc" stroke-width="2"/>
+    <text x="50" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">
+      CAP
+    </text>
+    <text x="50" y="50" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">
+      Request Limit
+    </text>
+  </g>
+  
+  <!-- Arrow 1 -->
+  <g transform="translate(160, 90)">
+    <path d="M 0 0 L 30 0 L 25 -5 M 30 0 L 25 5" stroke="#666" stroke-width="2" fill="none"/>
+    <text x="15" y="-10" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666">
+      Request
+    </text>
+  </g>
+  
+  <!-- STREAM Box -->
+  <g transform="translate(200, 60)">
+    <rect width="100" height="60" rx="8" fill="#ffd700" stroke="#cc9900" stroke-width="2"/>
+    <text x="50" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">
+      STREAM
+    </text>
+    <text x="50" y="50" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">
+      Real-time
+    </text>
+  </g>
+  
+  <!-- Arrow 2 -->
+  <g transform="translate(160, 140)">
+    <path d="M 0 0 L 30 0 L 25 -5 M 30 0 L 25 5" stroke="#666" stroke-width="2" fill="none"/>
+    <text x="15" y="-10" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666">
+      Process
+    </text>
+  </g>
+  
+  <!-- SETTLE Box -->
+  <g transform="translate(125, 160)">
+    <rect width="100" height="60" rx="8" fill="#00d4ff" stroke="#0099cc" stroke-width="2"/>
+    <text x="50" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">
+      SETTLE
+    </text>
+    <text x="50" y="50" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">
+      Payment
+    </text>
+  </g>
+  
+  <!-- Solana Logo (simplified) -->
+  <g transform="translate(250, 170)">
+    <circle cx="25" cy="25" r="20" fill="#00d4ff" opacity="0.3"/>
+    <text x="25" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" font-weight="bold" fill="#1a1a2e">
+      SOL
+    </text>
+  </g>
+  
+  <!-- Description -->
+  <text x="200" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#666">
+    OCM: Open inference network with Solana settlement
+  </text>
+</svg>
